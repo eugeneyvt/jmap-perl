@@ -71,13 +71,26 @@ sub connect_imap {
   my $force = shift;
 
   if ($Self->{imap} and not $force) {
-    $Self->{lastused} = time();
-    return $Self->{imap};
+    # An idle IMAP session can receive BYE/EOF while this worker is serving
+    # cached JMAP reads. The Perl object still exists after the socket closes.
+    # is_open drains unsolicited responses nonblockingly; it sends no command
+    # and therefore adds no NOOP round trip to each mail operation.
+    my $usable = eval {
+      $Self->{imap}->state() >= Mail::IMAPTalk::Authenticated()
+        && $Self->{imap}->is_open();
+    };
+    if ($usable) {
+      $Self->{lastused} = time();
+      return $Self->{imap};
+    }
   }
 
   if ($Self->{imap}) {
-    $Self->{imap}->disconnect();
-    delete $Self->{imap};
+    # Close locally: LOGOUT on a dead socket can itself fail or block.
+    # release_socket returns ownership of the handle; it does not close it.
+    my $old = delete $Self->{imap};
+    my $socket = eval { $old->release_socket() };
+    eval { $socket->close() } if $socket;
   }
 
   my $usessl = $Self->_imap_ssl();

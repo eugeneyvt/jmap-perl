@@ -19,6 +19,10 @@ to reproduce the image.
   and flag readback, checking UIDVALIDITY and preserving other flags/labels.
 - Opt-in Suite false-to-null flag normalization (`JMAP_SUITE_FLAG_COMPAT=1`).
   Other mutations retain the upstream path.
+- Checks a cached IMAP connection nonblockingly before reusing it, and reconnects
+  after an idle BYE/EOF or lost authenticated state. No NOOP round trip is added
+  to each operation, and failed mail mutations are not replayed. Regression tests
+  use real local sockets, including the provider closing an idle connection.
 
 ## Images and releases
 

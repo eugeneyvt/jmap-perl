@@ -17,7 +17,7 @@ use MIME::Base64 qw(decode_base64);
 use MIME::QuotedPrint qw(decode_qp);
 use Sys::Hostname;
 
-my %KNOWN_SPECIALS = map { lc $_ => 1 } qw(\\HasChildren \\HasNoChildren \\NoSelect \\NoInferiors);
+my %ROLE_FLAGS = map { lc $_ => 1 } qw(\\Inbox \\Sent \\Drafts \\Trash \\Junk \\Spam \\Archive \\All \\AllMail \\Flagged \\Important);
 
 sub new {
   my $Class = shift;
@@ -529,8 +529,10 @@ sub move_card {
 sub folder_label {
   my ($prefix, $folder) = @_;
 
-  # A role is any flag that is not merely structural (\HasChildren etc).
-  my ($role) = grep { not $KNOWN_SPECIALS{lc $_} } @{ $folder->[0] || [] };
+  # LIST status/extension flags are not mailbox identities. In particular,
+  # Yandex sends \Marked/\Unmarked on many folders; using either as the label
+  # makes sync_folders collapse unrelated folders onto the same local row.
+  my ($role) = grep { $ROLE_FLAGS{lc $_} } @{ $folder->[0] || [] };
   return $role if $role;
 
   my $sep   = $folder->[1];

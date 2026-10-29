@@ -42,6 +42,7 @@ my %ROLE_MAP = (
   'bulk' => 'junk',
   'bulk mail' => 'junk',
   'junk' => 'junk',
+  'spam' => 'junk',
   'junk mail' => 'junk',
   'spam mail' => 'junk',
   'spam messages' => 'junk',
@@ -70,6 +71,7 @@ sub setuser {
 
   # Strip fields that belong to accounts.sqlite3, not the per-account iserver table
   my %iserver = %$args;
+  my $email = delete $iserver{email};
   delete $iserver{$_} for qw(poolid accountid force);
   $args = \%iserver;
 
@@ -88,12 +90,16 @@ sub setuser {
   }
 
   my $user = $Self->dgetone('account');
+  # The IMAP login may be a local username rather than an email address.
+  # Preserve the public address independently from transport credentials.
+  $email //= $user->{email} if $user;
+  $email //= $args->{username};
   if ($user) {
-    $Self->dmaybeupdate('account', {email => $args->{username}});
+    $Self->dmaybeupdate('account', {email => $email});
   }
   else {
     $Self->dinsert('account', {
-      email => $args->{username},
+      email => $email,
       jdeletedmodseq => 0,
       jhighestmodseq => 1,
     });

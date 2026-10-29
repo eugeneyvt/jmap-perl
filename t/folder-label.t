@@ -31,6 +31,15 @@ is($label->('INBOX.', [['\\HasNoChildren', '\\Sent'], '.', 'INBOX.Sent']), '\\Se
 is($label->('INBOX.', [['\\HasChildren', '\\NoSelect'], '.', 'INBOX.Stuff']), 'Stuff',
    'structural flags alone are not treated as a role');
 
+is($label->('', [['\\Marked'], '/', 'INBOX']), 'INBOX',
+   'Marked is a status flag, not a role');
+is($label->('', [['\\Unmarked'], '/', 'Sent']), 'Sent',
+   'Unmarked is a status flag, not a role');
+is($label->('', [['\\VendorFlag', '\\Unmarked'], '/', 'Projects']), 'Projects',
+   'unknown extension flags do not replace the folder identity');
+is($label->('', [['\\Marked', '\\sEnT'], '/', 'Sent']), '\\sEnT',
+   'a real special-use role wins even after a status flag');
+
 # --- the crash: NIL separator ----------------------------------------------
 
 {

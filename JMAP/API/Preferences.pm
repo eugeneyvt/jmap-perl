@@ -561,7 +561,7 @@ sub api_Identity_get {
     name               => $prefs->{name}          // $user->{displayname} // $user->{email} // '',
     textSignature      => $prefs->{textSignature}  // '',
     htmlSignature      => $prefs->{htmlSignature}  // '',
-    replyTo            => $prefs->{replyTo}        // ($user->{email} ? [{email => $user->{email}}] : undef),
+    replyTo            => $prefs->{replyTo}        // ($user->{email} ? [{name => '', email => $user->{email}}] : undef),
     bcc                => $prefs->{bcc},
     autoBcc            => '',
     addBccOnSMTP       => $JSON::false,

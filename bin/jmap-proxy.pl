@@ -651,6 +651,7 @@ sub run_backend_worker {
       }
       if ($cmd eq 'setup') {
         $db->setuser({
+          email      => $email,
           username   => $args->{username}   || $accountid,
           password   => $args->{password}   || '',
           imapHost   => $args->{imapHost},

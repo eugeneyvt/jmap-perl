@@ -13,6 +13,10 @@ to reproduce the image.
 - Opt-in Gmail app-password support (`JMAP_GMAIL_APP_PASSWORD=1`); the default
   OAuth path is preserved. SMTP uses the configured transport/STARTTLS settings.
 - Ignores `\\Noselect` containers when enumerating usable IMAP mailboxes.
+- Keeps IMAP status flags (`\\Marked`, `\\Unmarked`) separate from mailbox
+  roles, so repeated Yandex folder synchronization preserves every folder.
+  Generic IMAP accounts keep their public email separate from the login name,
+  and default sending identities include the reply-to display-name field.
 - Runs background synchronization on a separate worker, using registered
   accounts rather than open browser workers, and prevents overlapping syncs.
 - Updates `$seen`, `$flagged`, and `$answered` patches using targeted UID STORE

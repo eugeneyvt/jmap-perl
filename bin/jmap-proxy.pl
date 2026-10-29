@@ -45,6 +45,7 @@ use JMAP::FileNodeCopy;
 use JMAP::FileNode;   # max_bytes, is_too_large: the in-memory cap on one file's content
 use JMAP::Collation;
 use JMAP::Capabilities qw(imap_account_capabilities);
+use JMAP::Realtime;
 
 # Backend modules (loaded in child after fork)
 # use JMAP::API; use JMAP::ImapDB; etc.
@@ -81,6 +82,10 @@ my %backend;     # name => [AnyEvent::Handle, cmd_counter, pid, last_active]
 my %waiting;     # name => { cmd_id => [success_cb, error_cb] }
 my %backfilling; # accountid => 1 while prod_backfill loop is active
 my %sync_times;  # accountid => unix timestamp of last successful sync
+my %idle_watch;
+my %realtime_sync;
+my $IDLE_ENABLED = $ENV{JMAP_IDLE_ENABLE} // 0;
+my $IDLE_FALLBACK = $ENV{JMAP_IDLE_FALLBACK_SECONDS} || 30;
 
 # Take one pending entry, without autovivifying %waiting{$name} for a response
 # we were not expecting.
@@ -134,6 +139,7 @@ my %stat = (
   jmap_method_calls    => 0,
   jmap_method_errors   => 0,
   backend_errors       => 0,
+  idle_change_events   => 0,
   auth_cache_hits      => 0,
   auth_cache_misses    => 0,
 );
@@ -163,7 +169,21 @@ sub mk_json {
   return sub {
     my ($hdl, $res) = @_;
     if ($res->[0] eq 'push') {
-      PushEvent($accountid, 'state', { '@type' => 'StateChange', changed => { $accountid => $res->[1] } });
+      PushEvent($accountid, 'state', JMAP::Realtime::state_event($accountid, $res->[1]));
+    }
+    elsif ($res->[0] eq 'idle_status') {
+      my $aid = JMAP::Realtime::account_id($accountid);
+      if (my $entry = $idle_watch{$aid}) {
+        $entry->{active} = $res->[1]{active} ? 1 : 0;
+        $entry->{heartbeat} = time();
+        if ($entry->{active}) { $entry->{attempts} = 0 }
+        else { _idle_disconnected($accountid) }
+      }
+    }
+    elsif ($res->[0] eq 'idle_changed') {
+      my $aid = JMAP::Realtime::account_id($accountid);
+      $stat{idle_change_events}++;
+      prod_realtime_sync($aid) if $idle_watch{$aid};
     }
     elsif ($res->[0] eq 'synced') {
       (my $sync_aid = $accountid) =~ s/:[^:]+$//;
@@ -184,6 +204,7 @@ sub mk_json {
         $stat{backend_errors}++;
         warn "Backend error on $accountid: $res->[1]\n";
         delete $backend{$accountid};
+        _idle_disconnected($accountid);
         # Siblings first: this callback may issue a fresh request on the same
         # accountid, which must not then be swept up by the old failure.
         _fail_pending($accountid, "backend error: $res->[1]");
@@ -245,11 +266,13 @@ sub get_backend {
         my (undef, undef, $msg) = @_;
         warn "Backend handle error for $accountid: " . ($msg // '?') . "\n";
         delete $backend{$accountid};
+        _idle_disconnected($accountid);
         _fail_pending($accountid, "backend handle error: " . ($msg // 'unknown'));
       },
       on_eof => sub {
         warn "Backend handle EOF for $accountid\n";
         delete $backend{$accountid};
+        _idle_disconnected($accountid);
         _fail_pending($accountid, 'backend closed connection');
       },
     ), 0, $pid, time()];
@@ -376,6 +399,26 @@ sub run_backend_worker {
       if ($db && $db->in_transaction()) {
         warn "WORKER STALE TRANSACTION before $cmd ($tag) - rolling back\n";
         $db->reset();
+      }
+
+      if ($cmd eq 'watch_idle') {
+        require JMAP::IMAPIdle;
+        my $socket;
+        my $ok = eval {
+          $socket = $db->backend_cmd('idle_socket');
+          $write_json->(['watch_idle', { supported => $socket ? $JSON::true : $JSON::false }, $tag]);
+          if ($socket) {
+            JMAP::IMAPIdle->watch(socket => $socket, parent => $sock,
+              on_status => sub { $write_json->(['idle_status', { active => $JSON::true }, 'idle']) },
+              on_change => sub { $write_json->(['idle_changed', {}, 'idle']) });
+          }
+          1;
+        };
+        # Errors never include authentication material or raw provider responses.
+        eval { $write_json->(['idle_status', { active => $JSON::false }, 'idle']) };
+        eval { $socket->close() } if $socket;
+        warn "IDLE watcher stopped for $accountid\n" unless $ok;
+        exit 0;
       }
 
       if ($cmd eq 'signup') {
@@ -3859,6 +3902,8 @@ sub do_eventsource {
 
       my $conn_id = ++$push_conn_counter;
       my $chunk_cb_slot;  # current drain callback; undef briefly while the hdl is flushing
+      my $headers_flushed = 0;
+      my $pending_state = {};
       my $dead = 0;       # set to 1 once the connection is confirmed dead
 
       my $ping_timer;
@@ -3872,12 +3917,15 @@ sub do_eventsource {
       };
 
       # Write one SSE event. Returns 1=ok, 0=dead. If chunk_cb_slot is
-      # temporarily undef (mid-flush), the event is silently dropped — the
-      # next sync will catch up.  Death is detected when chunk_cb returns 0.
+      # temporarily undef (mid-flush), retain/coalesce state changes until the
+      # next drain callback. Death is detected when chunk_cb returns 0.
       my $write_sse = sub {
         my ($event, $data_ref) = @_;
         return 0 if $dead;
-        return 1 unless defined $chunk_cb_slot;  # mid-flush: drop but not dead
+        unless (defined $chunk_cb_slot) {
+          JMAP::Realtime::merge_state($pending_state, $data_ref) if $event eq 'state';
+          return 1;
+        }
         my $cb = $chunk_cb_slot;
         $chunk_cb_slot = undef;
         my $line = "event: $event\r\ndata: " . JSON::XS::encode_json($data_ref) . "\r\n\r\n";
@@ -3914,7 +3962,12 @@ sub do_eventsource {
       }, sub {
         my ($cb) = @_;
         $chunk_cb_slot = $cb;
-        # Don't call $cb here — wait for a push event or ping timer
+        # Flush headers immediately, without waiting 30-300s for the first ping.
+        if (keys %$pending_state) {
+          my $states = $pending_state; $pending_state = {};
+          $headers_flushed = 1;
+          $write_sse->('state', { '@type' => 'StateChange', changed => $states });
+        } elsif (!$headers_flushed++) { $write_sse->('ping', { interval => $ping_interval + 0 }) }
       }]);
 
     }, sub {
@@ -4525,6 +4578,8 @@ sub mgmt_metrics {
   $g->('jmap_backend_workers_active',  'Active per-account backend worker processes',    $workers);
   $g->('jmap_backend_queue_depth',     'Total pending backend requests across all workers', $queue);
   $g->('jmap_sse_connections_active',  'Open Server-Sent Events connections',            $sse);
+  $g->('jmap_idle_connected_accounts','Accounts with a healthy provider IDLE watcher',
+       scalar(grep { JMAP::Realtime::idle_healthy($_, time()) } values %idle_watch));
   $g->('jmap_backfilling_accounts',    'Accounts currently running a backfill loop',     $bf);
   $g->('jmap_auth_cache_entries',      'Entries currently in the auth token cache',      scalar(keys %auth_cache));
 
@@ -4534,6 +4589,7 @@ sub mgmt_metrics {
   $c->('jmap_method_errors',           'JMAP method calls that returned an error response', $stat{jmap_method_errors});
   $c->('jmap_backend_requests',        'Backend worker requests sent (all workers)',      $total_backend_cmds);
   $c->('jmap_backend_errors',          'Backend worker error responses received',        $stat{backend_errors});
+  $c->('jmap_idle_change_events',      'Provider IDLE change signals received',           $stat{idle_change_events});
   $c->('jmap_auth_cache_hits',         'Auth cache lookups that returned a cached result', $stat{auth_cache_hits});
   $c->('jmap_auth_cache_misses',       'Auth cache lookups that required a backend call',  $stat{auth_cache_misses});
 
@@ -4575,6 +4631,7 @@ if ($idle_timeout) {
       my $now = time();
       for my $name (keys %backend) {
         next if $name eq '__accounts__';  # keep accounts worker alive
+        next if $name =~ /:idle$/;       # persistent provider notification channel
         next if %{$waiting{$name} || {}};  # has in-flight requests
         my $idle = $now - ($backend{$name}[3] || 0);
         if ($idle > $idle_timeout) {
@@ -4611,6 +4668,59 @@ my $token_flush_timer = AnyEvent->timer(
 # RULE: backfill and sync/jmap MUST NEVER share a worker process.
 #
 my $SYNC_INTERVAL = $ENV{JMAP_SYNC_INTERVAL} || 30;
+
+sub prod_realtime_sync {
+  my ($aid) = @_;
+  return if $shutting_down || $realtime_sync{$aid};
+  $realtime_sync{$aid} = AnyEvent->timer(after => 0.25, cb => sub {
+    delete $realtime_sync{$aid};
+    return unless $idle_watch{$aid};
+    my $name = "$aid:sync";
+    if (%{$waiting{$name} || {}}) { prod_realtime_sync($aid); return }
+    send_backend_request($name, 'sync', {}, sub {}, sub { warn "Event-driven sync failed for $aid\n" });
+  });
+}
+
+sub _idle_disconnected {
+  my ($name) = @_;
+  return unless $name =~ /:idle$/;
+  my $aid = JMAP::Realtime::account_id($name);
+  my $entry = $idle_watch{$aid} or return;
+  $entry->{active} = 0;
+  return if $shutting_down || $entry->{retry_timer};
+  my $attempt = ++$entry->{attempts};
+  $attempt = 6 if $attempt > 6;
+  my $delay = $entry->{unsupported} ? 300 : 5 * 2 ** ($attempt - 1);
+  $entry->{retry_timer} = AnyEvent->timer(after => $delay, cb => sub {
+    return unless $idle_watch{$aid};
+    delete $idle_watch{$aid}{retry_timer};
+    _ensure_idle($aid);
+  });
+  prod_realtime_sync($aid); # catch arrivals missed during disconnect
+}
+
+sub _ensure_idle {
+  my ($aid) = @_;
+  return unless $IDLE_ENABLED && !$shutting_down;
+  my $entry = $idle_watch{$aid} or return;
+  if (my $worker = $backend{"$aid:idle"}) {
+    if (time() - ($entry->{heartbeat} || $entry->{started} || time()) > 45) {
+      # A blocked TLS read/handshake must not keep an apparently alive watcher
+      # forever. Only our dedicated child is terminated; normal mail is separate.
+      kill 'TERM', $worker->[2];
+      delete $backend{"$aid:idle"};
+      _fail_pending("$aid:idle", 'IDLE heartbeat deadline exceeded');
+      _idle_disconnected("$aid:idle");
+    }
+    return;
+  }
+  return if $entry->{retry_timer};
+  $entry->{started} = time(); $entry->{heartbeat} = 0;
+  send_backend_request("$aid:idle", 'watch_idle', {}, sub {
+    my $result = shift;
+    $entry->{unsupported} = !$result->{supported};
+  }, sub { _idle_disconnected("$aid:idle") });
+}
 
 # prod_backfill: repeatedly send 'backfill' to a dedicated backfill child
 # until backfill() returns false (nothing left to backfill). Mirrors
@@ -4672,16 +4782,26 @@ sub schedule_send {
 }
 
 my $sync_timer = AnyEvent->timer(
-  after    => $SYNC_INTERVAL,
+  after    => $IDLE_ENABLED ? 0.1 : $SYNC_INTERVAL,
   interval => $SYNC_INTERVAL,
   cb       => sub {
     # Account discovery is independent of browser traffic and interactive workers.
     # Idle reaping of the read worker must not stop receiving mail.
     send_backend_request('__accounts__', 'list_accounts', {}, sub {
       my $accounts = shift;
+      my %registered = map { $_->{accountid} => 1 } grep { ($_->{type} // '') ne 'jmap' } @$accounts;
+      for my $aid (keys %idle_watch) {
+        next if $registered{$aid};
+        delete $idle_watch{$aid}; delete $realtime_sync{$aid};
+        delete $backend{"$aid:idle"}; # EOF stops the provider watcher
+      }
       for my $account (@$accounts) {
         next if ($account->{type} // '') eq 'jmap';
-        my $sync_name = "$account->{accountid}:sync";
+        my $aid = $account->{accountid};
+        $idle_watch{$aid} ||= {};
+        _ensure_idle($aid);
+        next unless JMAP::Realtime::needs_poll($idle_watch{$aid}, $sync_times{$aid}, time(), $IDLE_FALLBACK);
+        my $sync_name = "$aid:sync";
         next if %{$waiting{$sync_name} || {}};
         send_backend_request($sync_name, 'sync', {}, sub {}, sub {});
       }

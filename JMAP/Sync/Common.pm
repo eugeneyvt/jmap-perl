@@ -575,6 +575,16 @@ sub capability {
   return $imap->capability();
 }
 
+sub idle_socket {
+  my $Self = shift;
+  my $imap = $Self->connect_imap();
+  return undef unless $imap->capability()->{idle};
+  die "Cannot examine IDLE mailbox\n" unless $imap->examine('INBOX');
+  my $socket = $imap->release_socket();
+  delete $Self->{imap};
+  return $socket;
+}
+
 sub imap_noop {
   my $Self = shift;
   my $folders = shift;

@@ -30,6 +30,17 @@ to reproduce the image.
   after an idle BYE/EOF or lost authenticated state. No NOOP round trip is added
   to each operation, and failed mail mutations are not replayed. Regression tests
   use real local sockets, including the provider closing an idle connection.
+- Opt-in provider IMAP IDLE (`JMAP_IDLE_ENABLE=1`) on a dedicated read-only Inbox
+  connection per account. Signals coalesce into the separate sync worker; those
+  commits reach authenticated JMAP EventSource streams with canonical account
+  IDs. Watchers renew IDLE, heartbeat, reconnect with bounded backoff and exit
+  when the parent/account disappears. Unsupported/disconnected providers retain
+  polling. `JMAP_IDLE_FALLBACK_SECONDS` keeps full-account reconciliation (default
+  30 seconds; other provider folders still use that backstop).
+- EventSource headers flush immediately, and slow consumers retain coalesced
+  latest states rather than dropping changes mid-write. The management metrics
+  include healthy IDLE account and provider-change counters; no new public port
+  or credential is introduced.
 
 ## Images and releases
 

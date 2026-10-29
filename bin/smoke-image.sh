@@ -29,3 +29,4 @@ docker exec "$name" perl -MHTTP::Tiny -e '
   die "Unauthenticated session did not require authentication" unless $session->{status} == 401;
   print "Health and unauthenticated-session smoke checks passed.\n";
 '
+docker exec -w /opt/binarybay-jmap "$name" perl -I. bin/smoke-realtime.pl

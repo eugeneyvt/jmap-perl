@@ -48,12 +48,20 @@ sub access_token {
   return $Self->{access_token};
 }
 
-sub _imap_class { 'Mail::GmailTalk' }
-sub _imap_auth  { my $Self = shift; (Password => $Self->access_token()) }
+sub _imap_class { $ENV{JMAP_GMAIL_APP_PASSWORD} ? 'Mail::IMAPTalk' : 'Mail::GmailTalk' }
+sub _imap_auth {
+  my $Self = shift;
+  return (Password => $Self->{auth}{password}) if $ENV{JMAP_GMAIL_APP_PASSWORD};
+  return (Password => $Self->access_token());
+}
 sub _dav_auth   { my $Self = shift; (access_token => $Self->access_token()) }
 
 sub _smtp_transport {
   my ($Self, $helo) = @_;
+  if ($ENV{JMAP_GMAIL_APP_PASSWORD}) {
+    require JMAP::Sync::Standard;
+    return JMAP::Sync::Standard::_smtp_transport($Self, $helo);
+  }
   Email::Sender::Transport::GmailSMTP->new({
     helo          => $helo,
     host          => $Self->{auth}{smtpHost},

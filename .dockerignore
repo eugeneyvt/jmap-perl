@@ -4,8 +4,14 @@
 *.lock
 /data
 /doc
-/t
 *.tar.gz
 *.dhparam
 *.privatekey
 *.publiccert
+
+.env
+.env.*
+!.env.example
+*.sqlite3-*
+*.pem
+.secrets

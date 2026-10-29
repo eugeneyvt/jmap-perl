@@ -1,0 +1,22 @@
+# Reuse the exact dependency image already exercised with Suite. Source is
+# installed into a clean path so deleted upstream modules cannot linger.
+FROM ghcr.io/jmapio/jmap-proxy@sha256:74e2957eca8a340d7eb5cf06fa48f6bea6e2f1e6839361d582626405c0e6df1f
+
+RUN apt-get update && apt-get install -y --no-install-recommends libtext-diff-perl && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY . /opt/binarybay-jmap
+WORKDIR /opt/binarybay-jmap
+ENV JMAP_HOME=/opt/binarybay-jmap
+
+# Test data is synthetic and temporary. Integration tests requiring a real
+# Cyrus account explicitly skip unless configured; no mail credentials enter CI.
+RUN perl -I. -c bin/jmap-proxy.pl && prove -I. t/*.t
+
+ARG FORK_REVISION=unknown
+LABEL org.opencontainers.image.source="https://github.com/eugeneyvt/jmap-perl" \
+      org.opencontainers.image.revision="${FORK_REVISION}" \
+      org.opencontainers.image.title="Binary Bay JMAP bridge" \
+      org.opencontainers.image.licenses="MIT"
+
+ENTRYPOINT ["/opt/binarybay-jmap/bin/docker-entrypoint.sh"]

@@ -166,7 +166,8 @@ sub mk_json {
       PushEvent($accountid, 'state', { '@type' => 'StateChange', changed => { $accountid => $res->[1] } });
     }
     elsif ($res->[0] eq 'synced') {
-      $sync_times{$accountid} = $res->[1];
+      (my $sync_aid = $accountid) =~ s/:[^:]+$//;
+      $sync_times{$sync_aid} = $res->[1];
     }
     elsif ($res->[0] eq 'sendat') {
       schedule_send($accountid, $res->[1]);
@@ -1201,7 +1202,8 @@ sub run_accounts_worker {
         else {
           my $stored = $udb->selectrow_hashref(
             "SELECT password FROM iserver WHERE username = ?", {}, $email);
-          return ['auth', undef] unless $stored && $stored->{password} eq $password;
+          require JMAP::CredentialStore;
+          return ['auth', undef] unless $stored && JMAP::CredentialStore->decrypt($stored->{password}) eq $password;
         }
 
         # Create a token for this session
@@ -4672,12 +4674,17 @@ my $sync_timer = AnyEvent->timer(
   after    => $SYNC_INTERVAL,
   interval => $SYNC_INTERVAL,
   cb       => sub {
-    for my $name (keys %backend) {
-      next if $name eq '__accounts__';
-      next if $name =~ /:/;  # skip backfill and other sub-workers
-      next if %{$waiting{$name} || {}};  # skip if handling a request
-      send_backend_request($name, 'sync', {}, sub {}, sub {});
-    }
+    # Account discovery is independent of browser traffic and interactive workers.
+    # Idle reaping of the read worker must not stop receiving mail.
+    send_backend_request('__accounts__', 'list_accounts', {}, sub {
+      my $accounts = shift;
+      for my $account (@$accounts) {
+        next if ($account->{type} // '') eq 'jmap';
+        my $sync_name = "$account->{accountid}:sync";
+        next if %{$waiting{$sync_name} || {}};
+        send_backend_request($sync_name, 'sync', {}, sub {}, sub {});
+      }
+    }, sub { warn "Background account discovery failed\n" });
   },
 );
 

@@ -545,6 +545,7 @@ sub folders {
 
   my %folders;
   foreach my $folder (@folders) {
+    next if grep { lc($_) eq "\\noselect" } @{$folder->[0] || []};
     my $name = $folder->[2];
     next unless defined $name;   # a row with no name is not addressable
     $folders{$name} = [$folder->[1], folder_label($prefix, $folder)];
@@ -611,6 +612,28 @@ sub imap_myrights {
 }
 
 # no newname == delete
+# Patch only named flags, retaining server-side flags not known to the cache.
+sub imap_patch_flags {
+  my ($Self, $imapname, $expected_validity, $uids, $patch) = @_;
+  my %flag = ('$seen' => '\\Seen', '$flagged' => '\\Flagged', '$answered' => '\\Answered');
+  my $imap = $Self->connect_imap();
+  die "SELECT FAILED" unless $imap->select($imapname);
+  my $validity = $imap->get_response_code('uidvalidity') + 0;
+  die "UIDVALIDITY changed" unless $validity == $expected_validity;
+  my $set = join(',', @$uids);
+  for my $key (sort keys %$patch) {
+    die "Unsupported flag patch" unless exists $flag{$key};
+    my $operation = $patch->{$key} ? '+flags.silent' : '-flags.silent';
+    die "Flag update failed" unless $imap->store($set, $operation, '(' . $flag{$key} . ')');
+  }
+  my @fields = qw(uid flags);
+  push @fields, 'x-gm-labels' if $imap->capability->{'x-gm-ext-1'};
+  my $data = $imap->fetch($set, '(' . join(' ', @fields) . ')');
+  die "Flag readback failed" unless ref($data) eq 'HASH';
+  $Self->_unselect($imap);
+  return $data;
+}
+
 sub imap_update {
   my $Self = shift;
   my $imapname = shift;

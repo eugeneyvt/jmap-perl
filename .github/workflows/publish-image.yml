@@ -1,14 +1,18 @@
-name: Create and publish an OCI image
+name: Test and publish fork image
 
 on:
   push:
     branches: [ 'master' ]
+    tags: [ 'v*' ]
   workflow_dispatch: {}
+
+permissions:
+  contents: read
 
 env:
   REGISTRY: ghcr.io
   # Not github.repository: the repo is jmap-perl, the image is jmap-proxy.
-  IMAGE_NAME: jmapio/jmap-proxy
+  IMAGE_NAME: eugeneyvt/jmap-proxy
 
 jobs:
   # Each architecture builds natively on its own runner and pushes an
@@ -33,8 +37,17 @@ jobs:
       packages: write
 
     steps:
+      - name: Validate release version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF_TYPE" = tag && ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo 'Release tags must be vMAJOR.MINOR.PATCH; refusing to publish stable.'
+            exit 1
+          fi
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Log in to the Container registry
         uses: docker/login-action@v3
@@ -57,13 +70,31 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
 
-      - name: Build and push image by digest
+      - name: Build and test candidate
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.release
+          platforms: ${{ matrix.platform }}
+          load: true
+          tags: jmap-candidate:${{ matrix.arch }}
+          build-args: FORK_REVISION=${{ github.sha }}
+          cache-from: type=gha,scope=linux-${{ matrix.arch }}
+
+      - name: Verify startup without real accounts or network access
+        run: sh bin/smoke-image.sh jmap-candidate:${{ matrix.arch }}
+
+      - name: Publish tested image by digest
         id: build
         uses: docker/build-push-action@v6
         with:
           context: .
+          file: Dockerfile.release
           platforms: ${{ matrix.platform }}
+          build-args: FORK_REVISION=${{ github.sha }}
           labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=linux-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=linux-${{ matrix.arch }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
 
       - name: Record the digest
@@ -107,8 +138,11 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          flavor: latest=false
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=edge,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=raw,value=stable,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
             type=sha,format=short
 
       - name: Create the multi-arch manifest

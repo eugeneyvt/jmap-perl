@@ -987,8 +987,29 @@ sub api_Email_set {
 
   my $scoped_lock = $Self->{db}->begin_superlock();
 
-  # get state up-to-date first
-  $Self->{db}->sync_imap();
+  # Suite sends false for a removed keyword; JMAP represents removal with null.
+  # This private bridge's opt-in adapter normalizes only known flag patch values.
+  if ($ENV{JMAP_SUITE_FLAG_COMPAT}) {
+    for my $patch (values %$update) {
+      next unless ref($patch) eq 'HASH';
+      for my $key (keys %$patch) {
+        $patch->{$key} = undef if $key =~ m{^keywords/\$(?:seen|flagged|answered)$}
+          && JSON::is_bool($patch->{$key}) && !$patch->{$key};
+      }
+    }
+  }
+  # Flag patches need only their target UIDs, not a complete mailbox rescan.
+  # Whole-object replacements and every other mutation retain the original path.
+  my $fast_keywords = !keys(%$create) && !@$destroy && keys(%$update)
+    && $Self->{db}->can('update_keyword_patches');
+  for my $patch (values %$update) {
+    $fast_keywords = 0 unless ref($patch) eq 'HASH' && keys(%$patch);
+    for my $key (keys %{$patch || {}}) {
+      $fast_keywords = 0 unless $key =~ m{^keywords/\$(?:seen|flagged|answered)$}
+        && (!defined($patch->{$key}) || _is_true($patch->{$key}));
+    }
+  }
+  $Self->{db}->sync_imap() unless $fast_keywords;
 
   $Self->begin();
   my $user = $Self->{db}->get_user();
@@ -1023,14 +1044,17 @@ sub api_Email_set {
 
   ($created, $notCreated) = $Self->{db}->create_messages($create, sub { $Self->idmap(shift) });
   $Self->setid($_, $created->{$_}{id}) for keys %$created;
-  $Self->_resolve_patch($update, 'api_Email_get');
-  ($updated, $notUpdated) = $Self->{db}->update_messages($update, sub { $Self->idmap(shift) });
+  if ($fast_keywords) {
+    ($updated, $notUpdated) = $Self->{db}->update_keyword_patches($update, sub { $Self->idmap(shift) });
+  } else {
+    $Self->_resolve_patch($update, 'api_Email_get');
+    ($updated, $notUpdated) = $Self->{db}->update_messages($update, sub { $Self->idmap(shift) });
+  }
   $notCreated->{$_} = { type => 'invalidProperties', properties => ['keywords'] } for keys %badCreate;
   $notUpdated->{$_} = { type => 'invalidProperties', properties => ['keywords'] } for keys %badUpdate;
   ($destroyed, $notDestroyed) = $Self->{db}->destroy_messages($destroy);
 
-  # XXX - cheap dumb racy version
-  $Self->{db}->sync_imap();
+  $Self->{db}->sync_imap() unless $fast_keywords;
 
   $Self->begin();
   $user = $Self->{db}->get_user();

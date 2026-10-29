@@ -2,3 +2,12 @@ config.json
 jmap-proxy.local.dhparam
 jmap-proxy.local.privatekey
 jmap-proxy.local.publiccert
+
+.env
+.env.*
+!.env.example
+*.sqlite3
+*.sqlite3-*
+*.lock
+/data/
+.secrets/

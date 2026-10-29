@@ -3397,6 +3397,48 @@ sub import_message {
   return ($msgdata->{msgid}, $msgdata->{thrid}, $msgdata->{size});
 }
 
+# The API holds the account superlock. Network I/O stays outside transactions.
+# Never advance a folder's sync checkpoint from a partial UID fetch.
+sub update_keyword_patches {
+  my ($Self, $changes, $idmap) = @_;
+  my (%changed, %failed);
+  for my $input_id (keys %$changes) {
+    my $id = $idmap->($input_id);
+    $Self->begin();
+    my $rows = $Self->dget('imessages', {msgid => $id}, 'ifolderid,uid');
+    my $folders = $Self->dget('ifolders');
+    $Self->commit();
+    unless (@$rows) { $failed{$input_id} = {type => 'notFound'}; next }
+    my %folder = map { $_->{ifolderid} => $_ } @$folders;
+    my %uids;
+    push @{$uids{$_->{ifolderid}}}, $_->{uid} for @$rows;
+    my %patch = map { (substr($_, 9), $changes->{$input_id}{$_}) } keys %{$changes->{$input_id}};
+    my $ok = eval {
+      for my $fid (sort keys %uids) {
+        my $f = $folder{$fid} or die "Folder missing";
+        my $data = $Self->backend_cmd('imap_patch_flags', $f->{imapname}, $f->{uidvalidity}, $uids{$fid}, \%patch);
+        die "Message missing" if grep { !exists $data->{$_} } @{$uids{$fid}};
+        $Self->begin();
+        for my $uid (@{$uids{$fid}}) {
+          my $flags = $data->{$uid}{flags};
+          die "Missing flag readback" unless ref($flags) eq 'ARRAY';
+          my @labels = $Self->calclabels(lc($f->{label}) eq '\\allmail' ? undef : $f->{label}, $data->{$uid});
+          $Self->changed_record($fid, $uid, $flags, \@labels);
+        }
+        $Self->commit();
+      }
+      1;
+    };
+    if ($ok) { $changed{$input_id} = undef }
+    else {
+      $Self->rollback() if $Self->in_transaction();
+      $failed{$input_id} = {type => 'serverFail', description => 'Flag update could not be confirmed'};
+    }
+  }
+  $Self->sync_jmap();
+  return (\%changed, \%failed);
+}
+
 sub update_messages {
   my $Self = shift;
   my $changes = shift;

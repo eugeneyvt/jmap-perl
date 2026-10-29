@@ -27,6 +27,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libswitch-perl            \
     ca-certificates           \
     libcryptx-perl            \
+    libtext-diff-perl         \
     sqlite3                   \
     libpng-dev libjpeg62-turbo-dev libgif-dev libwebp-dev \
     liblzma-dev libzstd-dev   \

@@ -1,0 +1,16 @@
+services:
+  jmap:
+    image: ghcr.io/eugeneyvt/jmap-proxy:stable
+    restart: unless-stopped
+    environment:
+      BASEURL: ${JMAP_BASEURL:-http://127.0.0.1:9000}
+      JMAP_SECRET_KEY: ${JMAP_SECRET_KEY:?Set a persistent random 64-character hexadecimal key}
+      JMAP_MGMT_HOST: 127.0.0.1
+      JMAP_GMAIL_APP_PASSWORD: "1"
+      JMAP_SUITE_FLAG_COMPAT: "1"
+    ports:
+      - 127.0.0.1:9000:9000
+    volumes:
+      - mail-state:/data
+volumes:
+  mail-state:

@@ -1,3 +1,14 @@
+# Binary Bay JMAP bridge fork
+
+Personal compatibility fork of [jmapio/jmap-perl](https://github.com/jmapio/jmap-perl).
+See [FORK.md](FORK.md) for supported changes, tested releases, updates and rollback.
+Published images: `ghcr.io/eugeneyvt/jmap-proxy` (`stable`, version tags, `edge`).
+
+The upstream README follows. Its feature claims are not a guarantee of Frappe
+Suite interoperability; the acceptance limits in FORK.md apply to this fork.
+
+---
+
 # JMAP Proxy
 
 A proxy server that bridges IMAP/CalDAV/CardDAV mail backends to the

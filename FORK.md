@@ -17,6 +17,9 @@ to reproduce the image.
   roles, so repeated Yandex folder synchronization preserves every folder.
   Generic IMAP accounts keep their public email separate from the login name,
   and default sending identities include the reply-to display-name field.
+- Retries read-only metadata FETCH up to three times when the IMAP client returns
+  an error instead of a message map. A persistent failure preserves the sync
+  checkpoint instead of silently skipping an unread range.
 - Runs background synchronization on a separate worker, using registered
   accounts rather than open browser workers, and prevents overlapping syncs.
 - Updates `$seen`, `$flagged`, and `$answered` patches using targeted UID STORE

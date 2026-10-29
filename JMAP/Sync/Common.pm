@@ -961,7 +961,18 @@ sub imap_fetch {
     next if ($highestmodseq and $item->[3] and $item->[3] == $highestmodseq);
     my @extra;
     push @extra, "(changedsince $item->[3])" if ($item->[3] and $imap->capability->{condstore});
-    my $data = $imap->fetch("$from:$to", "(@flags)", @extra) || {};
+    # A transient untagged NO (seen on Yandex's historical messages) can make
+    # IMAPTalk return an error string even when the tagged completion is OK.
+    # Never turn a failed FETCH into an empty successful range: do_folder would
+    # advance uidfirst past messages that have not actually been imported.
+    # FETCH is read-only, so bounded retries cannot duplicate mail mutations.
+    my $data;
+    for (1..3) {
+      $data = $imap->fetch("$from:$to", "(@flags)", @extra);
+      last if ref($data) eq 'HASH';
+    }
+    die "IMAP FETCH did not return message data; synchronization checkpoint preserved\n"
+      unless ref($data) eq 'HASH';
     $res{$key} = [$item, $data];
   }
   $Self->_unselect($imap);

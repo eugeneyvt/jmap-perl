@@ -5,7 +5,8 @@ use warnings;
 sub account_id { my $id = $_[0]; $id =~ s/:[^:]+$//; return $id }
 sub state_event {
   my ($worker, $states) = @_;
-  return { '@type' => 'StateChange', changed => { account_id($worker) => $states } };
+  my %wire = map { $_ => '' . $states->{$_} } keys %$states;
+  return { '@type' => 'StateChange', changed => { account_id($worker) => \%wire } };
 }
 sub idle_healthy {
   my ($entry, $now) = @_;

@@ -78,6 +78,8 @@ sub reap {
 is_deeply(JMAP::Realtime::state_event('gmail:sync',{Email=>'2'}),
   {'@type'=>'StateChange',changed=>{gmail=>{Email=>'2'}}},
   'background worker suffix never leaks into authenticated account IDs');
+my $numeric=JMAP::Realtime::state_event('gmail:sync',{Email=>2});
+like(JSON::XS::encode_json($numeric),qr/"Email":"2"/,'wire state counters are JSON strings');
 ok(!JMAP::Realtime::needs_poll({active=>1,heartbeat=>100},100,101,300),'healthy IDLE uses events');
 ok(JMAP::Realtime::needs_poll({active=>1,heartbeat=>100},100,150,300),'lost watcher heartbeat restores polling');
 ok(JMAP::Realtime::needs_poll({active=>0},100,101,300),'disconnect restores polling');

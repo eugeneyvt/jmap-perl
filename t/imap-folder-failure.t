@@ -11,7 +11,12 @@ use JMAP::Sync::Common;
 
 {
   package FolderReplyImap;
-  sub namespace { $_[0]{last_error} = $_[0]{namespace_error}; $_[0]{namespace} }
+  sub namespace {
+    my $self = shift;
+    if ($self->{namespace_error}) { $self->{last_error} = $self->{namespace_error}; return undef }
+    # Like Mail::IMAPTalk's cached namespace(), leave an older LIST error alone.
+    return $self->{namespace};
+  }
   sub capability { $_[0]{capabilities} || {} }
   sub list { $_[0]{last_error} = $_[0]{error}; @{$_[0]{rows}} }
   sub xlist { shift->list() }
@@ -69,9 +74,11 @@ for my $case (
 }
 
 $imap->{namespace} = undef;
+$imap->{rows} = [[[], '/', 'INBOX'], [[], '/', 'Sent']];
+$imap->{error} = undef;
 my $ok = eval { $db->sync_folders(); 1 };
-ok(!$ok, 'failed NAMESPACE is rejected');
-is_deeply(snapshot(), $before, 'failed NAMESPACE preserves the snapshot');
+ok($ok, 'an unavailable optional NAMESPACE does not prevent a valid LIST');
+is_deeply(snapshot(), $before, 'undefined namespace retains folder IDs and checkpoints');
 
 $imap->{namespace} = [[['', '/']]];
 $imap->{rows} = [[[], '/', 'INBOX'], [[], '/', 'Sent'], [[], '/', 'Archive']];
@@ -91,10 +98,16 @@ ok(eval { $db->sync_folders(); 1 }, 'a successful NIL personal namespace still p
 is_deeply(snapshot(), $before_nil, 'NIL namespace retains existing folder IDs and checkpoints');
 
 $imap->{namespace_error} = 'NO unavailable';
+$imap->{rows} = [undef];
+$imap->{error} = 'connection closed';
 $ok = eval { $db->sync_folders(); 1 };
-ok(!$ok, 'an actual NAMESPACE command failure is rejected even with partial data');
-is_deeply(snapshot(), $before_nil, 'NAMESPACE command failure preserves folders');
+ok(!$ok, 'a failed NAMESPACE followed by a failed LIST is rejected');
+is_deeply(snapshot(), $before_nil, 'connection failure preserves folders');
 $imap->{namespace_error} = undef;
+$imap->{rows} = [[[], '/', 'INBOX'], [[], '/', 'Sent'], [[], '/', 'Archive']];
+$imap->{error} = undef;
+ok(eval { $db->sync_folders(); 1 }, 'cached namespace with an older LIST error permits recovery');
+is_deeply(snapshot(), $before_nil, 'recovered LIST retains the same folder IDs and checkpoints');
 
 # A successful nonempty snapshot may still remove a genuinely deleted folder.
 $imap->{rows} = [[[], '/', 'INBOX'], [[], '/', 'Archive']];

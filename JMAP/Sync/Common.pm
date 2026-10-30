@@ -553,14 +553,13 @@ sub folders {
   my $imap = $Self->connect_imap();
 
   my $namespace = $imap->namespace();
-  die "IMAP namespace unavailable; cached folders preserved\n"
-    if $imap->get_last_error() || ref($namespace) ne 'ARRAY';
-  # RFC 2342 permits NIL for the personal namespace. LIST can still return
-  # usable folders in that case; retain the undefined-prefix fallback.
+  # NAMESPACE is optional, and a successful response may have a NIL personal
+  # namespace. LIST is authoritative: retain the undefined-prefix fallback.
+  # namespace() caches its answer, so get_last_error() here may belong to an
+  # earlier LIST and must not prevent a subsequent successful LIST retry.
   my ($prefix, $sep);
-  if (defined $namespace->[0]) {
-    die "Invalid IMAP namespace; cached folders preserved\n"
-      unless ref($namespace->[0]) eq 'ARRAY' && ref($namespace->[0][0]) eq 'ARRAY';
+  if (ref($namespace) eq 'ARRAY' && ref($namespace->[0]) eq 'ARRAY'
+      && ref($namespace->[0][0]) eq 'ARRAY') {
     ($prefix, $sep) = @{$namespace->[0][0]}[0, 1];
   }
   my $listcmd = $imap->capability()->{xlist} ? 'xlist' : 'list';

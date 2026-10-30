@@ -24,6 +24,7 @@ die 'Default OAuth path changed' unless $backend->_imap_class() eq 'Mail::GmailT
     package MockImap;
     sub namespace { [ [ ['', '/'] ] ] }
     sub capability { {} }
+    sub get_last_error { undef }
     sub list { ([['\\Noselect'],'/','[Gmail]'], [[], '/', 'INBOX']) }
     package MockFolders;
     use parent 'JMAP::Sync::Common';

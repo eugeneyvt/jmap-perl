@@ -165,7 +165,18 @@ sub sync_folders {
   my $Self = shift;
 
   my $data = $Self->backend_cmd('folders');
+  die "Invalid folder snapshot; cached folders preserved\n"
+    unless ref($data) eq 'ARRAY' && ref($data->[1]) eq 'HASH';
   my ($prefix, $folders, $sep) = @$data;
+
+  # An existing IMAP account must not lose even Inbox on a transient empty
+  # LIST response. Reject it before opening the reconciliation transaction.
+  if (!keys %$folders) {
+    $Self->begin();
+    my $existing = $Self->dget('ifolders');
+    $Self->commit();
+    die "Empty folder snapshot; cached folders preserved\n" if @$existing;
+  }
 
   $Self->begin();
 

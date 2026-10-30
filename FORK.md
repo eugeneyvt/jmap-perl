@@ -17,11 +17,19 @@ to reproduce the image.
   roles, so repeated Yandex folder synchronization preserves every folder.
   Generic IMAP accounts keep their public email separate from the login name,
   and default sending identities include the reply-to display-name field.
+- Rejects failed/malformed IMAP folder listings and preserves existing cached
+  folders on an empty snapshot. A disconnected LIST cannot hide Inbox and the
+  other folders while the next successful synchronization is pending.
 - Retries read-only metadata FETCH up to three times when the IMAP client returns
   an error instead of a message map. A persistent failure preserves the sync
   checkpoint instead of silently skipping an unread range.
 - Runs background synchronization on a separate worker, using registered
   accounts rather than open browser workers, and prevents overlapping syncs.
+- Uses SQLite's existing mailbox-membership index and date ordering for common
+  mailbox lists (including unread/keyword filters). It avoids materializing and
+  sorting every message's metadata in Perl. Pagination, thread collapsing,
+  tie-breaking, query-state caches and the general search path are preserved;
+  no schema change or Suite patch is required.
 - Updates `$seen`, `$flagged`, and `$answered` patches using targeted UID STORE
   and flag readback, checking UIDVALIDITY and preserving other flags/labels.
 - Opt-in Suite false-to-null flag normalization (`JMAP_SUITE_FLAG_COMPAT=1`).

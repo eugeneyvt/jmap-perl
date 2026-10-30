@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.3 — 2026-10-31
+
+- Preserve compatibility with NIL personal namespaces and servers without the
+  optional NAMESPACE extension. LIST remains authoritative; only its failed or
+  invalid folder snapshot prevents reconciliation.
+- Allow a successful LIST retry when a cached namespace retains an older
+  command error. Add regression coverage for these recovery paths. This
+  corrects an overly strict v0.2.2 guard.
+
 ## 0.2.2 — 2026-10-31
 
 - Preserve the cached folder list when IMAP NAMESPACE/LIST fails, returns

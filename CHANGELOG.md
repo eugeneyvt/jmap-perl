@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.3 — 2026-10-31
+
+- Preserve compatibility with successful NAMESPACE responses whose personal
+  namespace is NIL. LIST can still provide usable folders, so this response is
+  accepted while actual command failures continue to preserve the cache.
+- Cover NIL namespaces and failed commands with partial namespace data in the
+  folder recovery regression tests. This corrects an overly strict v0.2.2 guard.
+
 ## 0.2.2 — 2026-10-31
 
 - Preserve the cached folder list when IMAP NAMESPACE/LIST fails, returns

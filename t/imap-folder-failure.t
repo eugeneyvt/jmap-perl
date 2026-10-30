@@ -11,11 +11,11 @@ use JMAP::Sync::Common;
 
 {
   package FolderReplyImap;
-  sub namespace { $_[0]{namespace} }
+  sub namespace { $_[0]{last_error} = $_[0]{namespace_error}; $_[0]{namespace} }
   sub capability { $_[0]{capabilities} || {} }
-  sub list { @{$_[0]{rows}} }
-  sub xlist { @{$_[0]{rows}} }
-  sub get_last_error { $_[0]{error} }
+  sub list { $_[0]{last_error} = $_[0]{error}; @{$_[0]{rows}} }
+  sub xlist { shift->list() }
+  sub get_last_error { $_[0]{last_error} }
   sub logout { 1 }
   package FolderReplyTransport;
   use parent 'JMAP::Sync::Common';
@@ -84,6 +84,17 @@ my %ids = map { $_->{name} => $_->{jmailboxid} } @{$recovered->{mailboxes}};
 for my $mailbox (@{$before->{mailboxes}}) {
   is($ids{$mailbox->{name}}, $mailbox->{jmailboxid}, 'successful retry keeps the existing mailbox ID');
 }
+
+my $before_nil = snapshot();
+$imap->{namespace} = [undef, undef, undef];
+ok(eval { $db->sync_folders(); 1 }, 'a successful NIL personal namespace still permits LIST');
+is_deeply(snapshot(), $before_nil, 'NIL namespace retains existing folder IDs and checkpoints');
+
+$imap->{namespace_error} = 'NO unavailable';
+$ok = eval { $db->sync_folders(); 1 };
+ok(!$ok, 'an actual NAMESPACE command failure is rejected even with partial data');
+is_deeply(snapshot(), $before_nil, 'NAMESPACE command failure preserves folders');
+$imap->{namespace_error} = undef;
 
 # A successful nonempty snapshot may still remove a genuinely deleted folder.
 $imap->{rows} = [[[], '/', 'INBOX'], [[], '/', 'Archive']];

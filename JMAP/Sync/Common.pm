@@ -553,10 +553,20 @@ sub folders {
   my $imap = $Self->connect_imap();
 
   my $namespace = $imap->namespace();
+  die "IMAP namespace unavailable; cached folders preserved\n"
+    unless ref($namespace) eq 'ARRAY' && ref($namespace->[0]) eq 'ARRAY'
+      && ref($namespace->[0][0]) eq 'ARRAY';
   my $prefix = $namespace->[0][0][0];
   my $sep    = $namespace->[0][0][1];
   my $listcmd = $imap->capability()->{xlist} ? 'xlist' : 'list';
   my @folders = $imap->$listcmd('', '*');
+  # LIST can return undef (or partial untagged rows) after NO/BYE/EOF.
+  # Never turn a failed read into an authoritative empty folder snapshot.
+  die "IMAP folder listing failed; cached folders preserved\n"
+    if $imap->get_last_error();
+  die "Invalid IMAP folder listing; cached folders preserved\n"
+    if grep { ref($_) ne 'ARRAY' || ref($_->[0]) ne 'ARRAY'
+      || !defined($_->[2]) || !length($_->[2]) } @folders;
 
   my %folders;
   foreach my $folder (@folders) {

@@ -367,6 +367,48 @@ sub api_SearchSnippet_get {
   return $messages;
 }
 
+# Common mailbox browsing needs only an ordered list of IDs. Keep the general
+# path for search, thread-wide predicates and other sorts: those can depend on
+# messages outside the requested mailbox.
+sub _mailbox_query_rows {
+  my ($Self, $args) = @_;
+  my $sort = $args->{sort};
+  return unless ref($sort) eq 'ARRAY' && @$sort == 1
+    && ($sort->[0]{property} // '') eq 'receivedAt';
+  my $filter = $args->{filter};
+  return unless ref($filter) eq 'HASH';
+  my @conditions = ($filter);
+  if (($filter->{operator} // '') eq 'AND') {
+    return unless keys(%$filter) == 2 && ref($filter->{conditions}) eq 'ARRAY';
+    @conditions = @{$filter->{conditions}};
+  }
+  my %simple;
+  for my $condition (@conditions) {
+    return unless ref($condition) eq 'HASH';
+    for my $key (keys %$condition) {
+      return unless $key eq 'inMailbox' || $key eq 'hasKeyword' || $key eq 'notKeyword';
+      return if exists $simple{$key} || ref($condition->{$key});
+      $simple{$key} = $condition->{$key};
+    }
+  }
+  return unless $simple{inMailbox};
+  my $direction = defined($sort->[0]{isAscending}) && !$sort->[0]{isAscending} ? 'DESC' : 'ASC';
+  my $rows = $Self->{db}->dbh->selectall_arrayref(
+    "SELECT m.msgid,m.thrid,m.jmodseq,m.keywords FROM jmessagemap mm
+       JOIN jmessages m ON m.msgid=mm.msgid
+       WHERE mm.jmailboxid=? AND mm.active=1 AND m.active=1
+       ORDER BY COALESCE(m.internaldate,0) $direction,m.msgid ASC",
+    {Slice => {}}, $Self->idmap($simple{inMailbox}));
+  if ($simple{hasKeyword} || $simple{notKeyword}) {
+    $rows = [grep {
+      my $keywords = decode_json($_->{keywords} || '{}');
+      (!$simple{hasKeyword} || $keywords->{$simple{hasKeyword}})
+        && (!$simple{notKeyword} || !$keywords->{$simple{notKeyword}})
+    } @$rows];
+  }
+  return $rows;
+}
+
 sub api_Email_query {
   my $Self = shift;
   my $args = shift;
@@ -389,15 +431,21 @@ sub api_Email_query {
       unless $valid_sort{$arg->{property} // ''};
   }
 
-  my $data = $Self->{db}->dget('jmessages', { active => 1 });
+  my $data = $Self->_mailbox_query_rows($args);
+  if (defined $data) {
+    $Self->commit();
+  }
+  else {
+    $data = $Self->{db}->dget('jmessages', { active => 1 });
 
-  # commit before applying the filter, because it might call out for searches
-  $Self->commit();
+    # Commit before filtering: a general search may call out to the provider.
+    $Self->commit();
 
-  map { $_->{keywords} = decode_json($_->{keywords} || {}) } @$data;
-  my $storage = {data => $data};
-  $data = $Self->_post_sort($data, $args->{sort}, $storage);
-  $data = $Self->_messages_filter($data, $args->{filter}, $storage) if $args->{filter};
+    map { $_->{keywords} = decode_json($_->{keywords} || {}) } @$data;
+    my $storage = {data => $data};
+    $data = $Self->_post_sort($data, $args->{sort}, $storage);
+    $data = $Self->_messages_filter($data, $args->{filter}, $storage) if $args->{filter};
+  }
   $data = $Self->_collapse_messages($data) if $args->{collapseThreads};
 
   $Self->{db}->save_query('Email', {

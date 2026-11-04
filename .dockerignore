@@ -1,4 +1,5 @@
 .git
+.dev
 .claude
 *.sqlite3
 *.lock

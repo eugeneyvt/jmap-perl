@@ -1337,7 +1337,7 @@ sub api_Email_parse {
       next;
     }
 
-    my $data = eval { Data::JSEmail::parse($content, $blobId) };
+    my $data = eval { JMAP::Telemetry::measure('mime', sub { Data::JSEmail::parse($content, $blobId) }) };
     if ($@ || !$data) {
       push @notParsable, $blobId;
       next;

@@ -27,9 +27,12 @@ sub new {
 
 sub DESTROY {
   my $Self = shift;
-  if ($Self->{imap}) {
-    $Self->{imap}->logout();
-    delete $Self->{imap};
+  if (my $imap = delete $Self->{imap}) {
+    # Destruction is not a new protocol operation. LOGOUT on a broken TLS
+    # connection can block a retiring worker and retain its process budget.
+    # Explicit disconnect() still performs an intentional graceful LOGOUT.
+    my $socket = eval { $imap->release_socket() };
+    eval { $socket->close() } if $socket;
   }
 }
 
@@ -202,7 +205,7 @@ sub send_email {
     %args,
     transport => $Self->_smtp_transport($helo),
   });
-  warn "send_email: sent from $args{from}\n";
+  warn "SMTP transport accepted message\n";
 }
 
 sub get_calendars {

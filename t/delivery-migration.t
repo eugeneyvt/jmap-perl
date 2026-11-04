@@ -1,0 +1,38 @@
+use strict;
+use warnings;
+use Test::More;
+BEGIN {
+  require File::Temp;
+  $ENV{JMAP_DATADIR}=File::Temp::tempdir(CLEANUP=>1);
+  $ENV{JMAP_SECRET_KEY}='e' x 64;
+}
+use JMAP::ImapDB;
+use JMAP::Delivery;
+my $db=JMAP::ImapDB->new('legacy');
+$db->setuser({username=>'synthetic',password=>'synthetic',imapHost=>'example.invalid'});
+$db->begin();
+$db->dmake('jmessages',{msgid=>'m1',thrid=>'t1',keywords=>'{}'});
+my $id=$db->dmake('jsubmission',{msgid=>'m1',thrid=>'t1',sendat=>1,undoStatus=>'pending'});
+my $old_state=$db->get_user()->{jstateEmailSubmission};
+$db->dbh->do('DROP TABLE jdelivery');
+$db->dbh->do('PRAGMA user_version=12');
+$db->commit();
+$db->write_subdir('outbox',"$id.eml",'synthetic original');
+$db=JMAP::ImapDB->new('legacy');
+$db->begin();
+my ($v)=$db->dbh->selectrow_array('PRAGMA user_version');
+is($v,13,'v12 migration advances version only with journal present');
+my $row=$db->dbh->selectrow_hashref('SELECT state,error_code FROM jdelivery WHERE jsubid=?',{},$id);
+is($row->{state},'unknown','legacy pending delivery is quarantined, not presumed unsent');
+is($row->{error_code},'legacy_pending','reason for review persists');
+my ($pending)=$db->dbh->selectrow_array("SELECT count(*) FROM jsubmission WHERE undoStatus='pending'");
+is($pending,0,'older pending-only sender would not replay quarantined legacy job');
+my $new_state=$db->get_user()->{jstateEmailSubmission};
+isnt($new_state,$old_state,'migration invalidates client submission state when undoStatus changes');
+is($db->dgetfield('jmessages',{msgid=>'m1'},'msgid'),'m1','message identity survives migration');
+$db->commit();
+is($db->read_subdir('outbox',"$id.eml"),'synthetic original','migration retains exact held bytes');
+is($db->next_send_due(),undef,'quarantined legacy job does not start SMTP');
+$db=JMAP::ImapDB->new('legacy');
+is(JMAP::Delivery->summary($db)->{unknown},1,'migration and reopen are repeatable');
+done_testing;

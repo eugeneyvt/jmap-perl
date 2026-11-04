@@ -156,7 +156,7 @@ sub backend_cmd {
   }
 
   die "No such command $cmd" unless $Self->{backend}->can($cmd);
-  return $Self->{backend}->$cmd(@args);
+  return JMAP::Telemetry::measure($cmd eq 'send_email' ? 'smtp' : 'imap', sub { $Self->{backend}->$cmd(@args) });
 }
 
 # synchronise list from IMAP server to local folder cache
@@ -3400,7 +3400,7 @@ sub import_message {
   die "FAILED TO GET BACK STORED MESSAGE FROM IMAP SERVER" unless $msgdata;
 
   # save us having to download it again - drop out of transaction so we don't wait on the parse
-  my $message = Data::JSEmail::parse($rfc822, $msgdata->{msgid});
+  my $message = JMAP::Telemetry::measure('mime', sub { Data::JSEmail::parse($rfc822, $msgdata->{msgid}) });
 
   $Self->write_parsed_msg($msgdata->{msgid}, $message);
 
@@ -3841,7 +3841,9 @@ sub fill_messages {
       next unless $rfc822;
       my $msgid = $uhash->{$uid};
       next if $result{$msgid};
-      $result{$msgid} = $parsed{$msgid} = Data::JSEmail::parse($rfc822, $msgid);
+      $result{$msgid} = $parsed{$msgid} = JMAP::Telemetry::measure('mime', sub {
+        Data::JSEmail::parse($rfc822, $msgid);
+      });
     }
   }
 
@@ -5309,34 +5311,31 @@ sub create_submissions {
     my $held = defined $release && $release > $now;
     my $sendat = $held ? $release : $now;
 
+    require JMAP::Delivery;
+    my $prepared = JMAP::Delivery->prepare($Self, msgid=>$msgid, thrid=>$thrid,
+      envelope=>$envelope, identity=>$new->{$cid}{identityId}, message=>$message{$cid},
+      sendat=>$sendat, held=>$held);
+    my $id = $prepared->{jsubid};
+    $held = 1 if $prepared->{undoStatus} eq 'pending' && $prepared->{sendat} > $now;
+    if ($prepared->{state} eq 'unknown' || $prepared->{state} eq 'sending') {
+      $notcreated{$cid} = {type=>'serverFail', description=>'Previous sending outcome is unknown; reconcile before retrying.'};
+      next;
+    }
     unless ($held) {
-      eval { $Self->backend_cmd('send_email', $message{$cid}, _smtp_envelope($envelope)) };
-      if ($@) {
-        (my $err = "$@") =~ s/\s+at \S+ line \d+.*//s;
-        warn "send_email failed for $cid: $err\n";
-        $notcreated{$cid} = { type => 'serverFail', description => $err };
+      my $state = JMAP::Delivery->send($Self, $id);
+      unless ($state eq 'confirmed') {
+        $notcreated{$cid} = {type=>'serverFail', description=>'Sending outcome is unknown; the message will not be retried automatically.'};
         next;
       }
+      $prepared->{undoStatus} = 'final';
     }
-
-    $Self->begin();
-    my $id = $Self->dmake('jsubmission', {
-      sendat     => $sendat,
-      msgid      => $msgid,
-      thrid      => $thrid,
-      envelope   => $json->encode($envelope),
-      identity   => $new->{$cid}{identityId},
-      undoStatus => $held ? 'pending' : 'final',
-    });
-    $Self->commit();
-    $Self->write_subdir('outbox', "$id.eml", $message{$cid}) if $held;
     $Self->{_sendat_changed} = 1 if $held;
 
     # RFC 8620 S5.3: created carries the server-set properties
     $createmap{$cid} = {
       id         => "$id",
-      sendAt     => Data::JSEmail::isodate($sendat),
-      undoStatus => $held ? 'pending' : 'final',
+      sendAt     => Data::JSEmail::isodate($prepared->{sendat}),
+      undoStatus => $prepared->{undoStatus},
       (defined $new->{$cid}{envelope} ? () : (envelope => $envelope)),
     };
   }
@@ -5372,7 +5371,14 @@ sub update_submissions {
         next;
       }
       $Self->begin();
+      my ($delivery_state) = $Self->dbh->selectrow_array('SELECT state FROM jdelivery WHERE jsubid=?', {}, $subid);
+      unless (defined($delivery_state) && $delivery_state eq 'prepared') {
+        $Self->commit();
+        $notupdated{$id} = {type=>'cannotUnsend'};
+        next;
+      }
       $Self->ddirty('jsubmission', { undoStatus => 'canceled' }, { jsubid => $subid });
+      $Self->dbh->do("UPDATE jdelivery SET state='canceled',updated=? WHERE jsubid=?", {}, time(), $subid);
       $Self->commit();
       $Self->unlink_subdir('outbox', "$subid.eml");
       $Self->{_sendat_changed} = 1;
@@ -5417,7 +5423,8 @@ sub next_send_due {
   my $Self = shift;
   $Self->begin();
   my ($when) = $Self->dbh->selectrow_array(
-    "SELECT MIN(sendat) FROM jsubmission WHERE undoStatus = 'pending'");
+    "SELECT MIN(s.sendat) FROM jsubmission s JOIN jdelivery d ON d.jsubid=s.jsubid
+       WHERE s.undoStatus='pending' AND d.state='prepared'");
   $Self->commit();
   return $when;
 }
@@ -5426,30 +5433,18 @@ sub next_send_due {
 sub send_due {
   my $Self = shift;
   my $now = time();
+  require JMAP::Delivery;
+  JMAP::Delivery->recover($Self);
   $Self->begin();
   my $due = $Self->dbh->selectall_arrayref(
-    "SELECT jsubid, envelope FROM jsubmission WHERE undoStatus = 'pending' AND sendat <= ?",
+    "SELECT s.jsubid FROM jsubmission s JOIN jdelivery d ON d.jsubid=s.jsubid
+       WHERE s.undoStatus='pending' AND d.state='prepared' AND s.sendat <= ?",
     { Slice => {} }, $now);
   $Self->commit();
 
   for my $row (@$due) {
     my $id = $row->{jsubid};
-    my $message = $Self->read_subdir('outbox', "$id.eml");
-    if (defined $message) {
-      eval { $Self->backend_cmd('send_email', $message, _smtp_envelope(decode_json($row->{envelope}))) };
-      if ($@) {
-        # leave it pending: the next send_due tries again
-        warn "send_due: submission $id failed, will retry: $@";
-        next;
-      }
-    }
-    else {
-      warn "send_due: submission $id has no held message\n";
-    }
-    $Self->begin();
-    $Self->ddirty('jsubmission', { undoStatus => 'final' }, { jsubid => $id });
-    $Self->commit();
-    $Self->unlink_subdir('outbox', "$id.eml");
+    JMAP::Delivery->send($Self, $id);
   }
 
   return $Self->next_send_due();

@@ -10,4 +10,5 @@ jmap-proxy.local.publiccert
 *.sqlite3-*
 *.lock
 /data/
+.dev/
 .secrets/

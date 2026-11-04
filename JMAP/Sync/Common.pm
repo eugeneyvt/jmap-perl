@@ -202,7 +202,7 @@ sub send_email {
     %args,
     transport => $Self->_smtp_transport($helo),
   });
-  warn "send_email: sent from $args{from}\n";
+  warn "SMTP transport accepted message\n";
 }
 
 sub get_calendars {

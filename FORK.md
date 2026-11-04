@@ -52,6 +52,12 @@ to reproduce the image.
 
 ## Images and releases
 
+**Unpublished candidate, 2026-11-04:** [stage 1 reliability](docs/stage1-reliability.md)
+adds atomic cache writes, post-commit notifications, bounded work/deadlines,
+private readiness/metrics and a durable SMTP-attempt journal (schema v13).
+The v0.2.3 deployment remains unchanged. Review the migration and rollback gates;
+the image-only update/rollback instructions below do not authorize this migration.
+
 Images are published to `ghcr.io/eugeneyvt/jmap-proxy`:
 
 | Tag | Meaning |

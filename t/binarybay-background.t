@@ -15,6 +15,7 @@ my (%idle_watch, %realtime_sync, %backend, %sync_times);
 my $IDLE_FALLBACK = 30;
 my @watchers;
 sub _ensure_idle { push @watchers, $_[0] }
+sub track_registered_accounts { }
 my @syncs;
 sub send_backend_request {
     my ($name, $cmd, $args, $callback) = @_;

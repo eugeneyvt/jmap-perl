@@ -46,6 +46,9 @@ use JMAP::FileNode;   # max_bytes, is_too_large: the in-memory cap on one file's
 use JMAP::Collation;
 use JMAP::Capabilities qw(imap_account_capabilities);
 use JMAP::Realtime;
+use JMAP::Telemetry;
+use JMAP::RuntimePolicy;
+use JMAP::RuntimeHealth;
 
 # Backend modules (loaded in child after fork)
 # use JMAP::API; use JMAP::ImapDB; etc.
@@ -68,9 +71,32 @@ my $oidc_cleanup = AnyEvent->timer(interval => 60, cb => sub {
     delete $oidc_codes{$_} for grep { $oidc_codes{$_}{exp} < $now } keys %oidc_codes;
 });
 
-# Reap zombie children
+my $runtime_policy = JMAP::RuntimePolicy->new(
+  max_workers => $ENV{JMAP_MAX_WORKERS} // 16,
+  per_worker => $ENV{JMAP_MAX_PENDING_PER_WORKER} // 4,
+  max_pending => $ENV{JMAP_MAX_PENDING} // 64,
+  max_bytes => $ENV{JMAP_MAX_PENDING_BYTES} // 32_000_000,
+  read_timeout => $ENV{JMAP_READ_DEADLINE} // 60,
+  background_timeout => $ENV{JMAP_BACKGROUND_DEADLINE} // 180,
+);
+my $runtime_health = JMAP::RuntimeHealth->new();
+sub observe_cgroup_memory {
+  if (open my $fh, '<', '/sys/fs/cgroup/memory.events') {
+    while (<$fh>) { $runtime_health->observe_oom($1, time()) if /^oom_kill (\d+)/ }
+    close $fh;
+  }
+}
+observe_cgroup_memory();
+my (%worker_names, %registered_accounts);
+my $accounts_discovered = 0;
+my $command_sequence = 0;
+
+# Reap zombie children; keep totals after a process disappears.
 my $child_watcher = AnyEvent->signal(signal => 'CHLD', cb => sub {
   while ((my $pid = waitpid(-1, WNOHANG)) > 0) {
+    my $status = $?;
+    my $name = delete $worker_names{$pid};
+    $runtime_health->exited($name, $status) if defined $name;
     warn "Reaped child $pid\n";
   }
 });
@@ -93,6 +119,8 @@ sub _take_pending {
   my ($name, $cmd) = @_;
   return undef unless exists $waiting{$name};
   my $entry = delete $waiting{$name}{$cmd};
+  $runtime_policy->finish($cmd) if $entry;
+  delete $entry->[2]{timer} if $entry && $entry->[2];
   delete $waiting{$name} unless %{ $waiting{$name} };
   return $entry;
 }
@@ -107,6 +135,8 @@ sub _fail_pending {
   my $entries = delete $waiting{$name} or return 0;
   my $n = 0;
   for my $cmd (sort keys %$entries) {
+    $runtime_policy->finish($cmd);
+    delete $entries->{$cmd}[2]{timer} if $entries->{$cmd}[2];
     $n++;
     # Each in its own eval: these unwind into HTTP response paths, and one of
     # them dying must not strand the connections behind all the others.
@@ -168,7 +198,11 @@ sub mk_json {
   my $accountid = shift;
   return sub {
     my ($hdl, $res) = @_;
-    if ($res->[0] eq 'push') {
+    return unless $backend{$accountid} && $backend{$accountid}[0] == $hdl;
+    if ($res->[0] eq 'telemetry') {
+      $runtime_health->ingest($accountid, $res->[1]);
+    }
+    elsif ($res->[0] eq 'push') {
       PushEvent($accountid, 'state', JMAP::Realtime::state_event($accountid, $res->[1]));
     }
     elsif ($res->[0] eq 'idle_status') {
@@ -204,6 +238,7 @@ sub mk_json {
         $stat{backend_errors}++;
         warn "Backend error on $accountid: $res->[1]\n";
         delete $backend{$accountid};
+        $runtime_policy->failed($accountid);
         _idle_disconnected($accountid);
         # Siblings first: this callback may issue a fresh request on the same
         # accountid, which must not then be swept up by the old failure.
@@ -211,6 +246,7 @@ sub mk_json {
         $entry->[1]->($res->[1]);
       }
       else {
+        $runtime_policy->succeeded($accountid);
         $backend{$accountid}[3] = time() if $backend{$accountid};
         $entry->[0]->($res->[1]);
       }
@@ -242,6 +278,11 @@ sub get_backend {
       # The child inherits the pending table but owns none of those connections.
       %backend = ();
       %waiting = ();
+      %worker_names = ();
+      # The child uses blocking IO, not the parent's event loop. Inherited
+      # signal watchers must not make a read-deadline termination ineffective.
+      $SIG{TERM} = 'DEFAULT';
+      $SIG{INT} = 'DEFAULT';
 
       eval {
         if ($accountid ne '__accounts__') {
@@ -264,18 +305,23 @@ sub get_backend {
       fh => $parent_sock,
       on_error => sub {
         my (undef, undef, $msg) = @_;
+        return unless $backend{$accountid} && $backend{$accountid}[2] == $pid;
         warn "Backend handle error for $accountid: " . ($msg // '?') . "\n";
         delete $backend{$accountid};
+        $runtime_policy->failed($accountid);
         _idle_disconnected($accountid);
         _fail_pending($accountid, "backend handle error: " . ($msg // 'unknown'));
       },
       on_eof => sub {
+        return unless $backend{$accountid} && $backend{$accountid}[2] == $pid;
         warn "Backend handle EOF for $accountid\n";
         delete $backend{$accountid};
+        $runtime_policy->failed($accountid);
         _idle_disconnected($accountid);
         _fail_pending($accountid, 'backend closed connection');
       },
     ), 0, $pid, time()];
+    $worker_names{$pid} = $accountid;
 
     $backend{$accountid}[0]->push_read(json => mk_json($accountid));
   }
@@ -378,10 +424,13 @@ sub run_backend_worker {
   eval { $init_db->() } if $type;
 
   my $last_activity = time();
+  my $last_space_sample;
 
   # Simple blocking request loop
   while (my $request = $read_json->()) {
-    my ($cmd, $args, $tag) = @$request;
+    my ($cmd, $args, $tag, $metadata) = @$request;
+    JMAP::Telemetry::record('queue', JMAP::Telemetry::now() - $metadata->{queued_at})
+      if ref($metadata) eq 'HASH' && defined $metadata->{queued_at};
     my $t0 = [Time::HiRes::gettimeofday()];
 
     my $res = eval {
@@ -1030,11 +1079,29 @@ sub run_backend_worker {
     unless ($res) {
       my $err = "$@";
       eval { $db->rollback() } if $db && $db->in_transaction();
+      eval { $write_json->(['telemetry', JMAP::Telemetry::drain(), 'metrics']) };
       warn "ERROR $cmd ($tag) ($accountid): $err\n";
       $write_json->(['error', $err, $tag]);
       last;  # die on error — parent will spawn fresh child
     }
     $res->[2] = $tag;
+    my $sample = JMAP::Telemetry::drain();
+    # This runs in a child: no subprocess or filesystem-capacity probe blocks
+    # the HTTP parent's event loop. Only the aggregate free byte count leaves it.
+    if (!defined($last_space_sample) || time() - $last_space_sample > 30) {
+      if (open my $df, '-|', 'df', '-Pk', $datadir) {
+        my @lines = <$df>; close $df;
+        my @fields = split /\s+/, ($lines[-1] // '');
+        $sample->{free_bytes} = 1024 * $fields[3] if @fields >= 6 && $fields[3] =~ /^\d+$/;
+      }
+      if ($db && $db->isa('JMAP::ImapDB')) {
+        require JMAP::Delivery;
+        $sample->{delivery} = JMAP::Delivery->summary($db);
+      }
+      $sample->{sampled_at} = time();
+      $last_space_sample = time();
+    }
+    $write_json->(['telemetry', $sample, 'metrics']);
     $write_json->($res);
 
     my $elapsed = Time::HiRes::tv_interval($t0);
@@ -1407,11 +1474,41 @@ sub send_backend_request {
   my $args = shift;
   my $cb = shift;
   my $errcb = shift;
+  my $bytes = length(JSON::XS::encode_json($args));
+  if (my $why = $runtime_policy->admission($accountid, $bytes, scalar(keys %worker_names), exists $backend{$accountid})) {
+    $runtime_health->{rejected}++;
+    ($errcb || sub {})->("backend busy: $why");
+    return;
+  }
   my $backend = get_backend($accountid);
-  my $cmd = "#" . $backend->[1]++;
+  my $cmd = "#" . $command_sequence++;
+  $backend->[1]++;
   $backend->[3] = time();
-  $waiting{$accountid}{$cmd} = [$cb || sub { 1 }, $errcb || sub { 1 }];
-  $backend->[0]->push_write(json => [$request, $args, $cmd]);
+  $runtime_policy->add($cmd, $accountid, $request, $args, $bytes);
+  $runtime_health->{requests}++;
+  my $entry = $waiting{$accountid}{$cmd} = [$cb || sub { 1 }, $errcb || sub { 1 }, {}];
+  if (JMAP::RuntimePolicy::safe_read($request, $args)) {
+    my $pid = $backend->[2];
+    my $deadline = $request =~ /\A(?:sync|backfill|davsync)\z/
+      ? $runtime_policy->{background_timeout} : $runtime_policy->{read_timeout};
+    $entry->[2]{timer} = AnyEvent->timer(after => $deadline, cb => sub {
+      return unless $waiting{$accountid}{$cmd} && $waiting{$accountid}{$cmd} == $entry;
+      $runtime_health->{expired}++;
+      # A cancelled/expired read never grants permission to terminate a write
+      # queued on the same serial worker. Keep bounded tombstones until reply.
+      my $fail = $entry->[1];
+      $entry->[0] = sub {}; $entry->[1] = sub {};
+      delete $entry->[2]{timer};
+      if ($backend{$accountid} && $backend{$accountid}[2] == $pid && $runtime_policy->all_safe($accountid)) {
+        kill 'KILL', $pid;
+        delete $backend{$accountid};
+        $runtime_policy->failed($accountid);
+        _fail_pending($accountid, 'read deadline exceeded');
+      }
+      $fail->('read deadline exceeded');
+    });
+  }
+  $backend->[0]->push_write(json => [$request, $args, $cmd, {queued_at=>JMAP::Telemetry::now()}]);
 }
 
 #
@@ -4176,7 +4273,8 @@ sub do_oidc_userinfo {
 #
 
 my $port = $ENV{JMAP_PORT} || 9000;
-my $httpd = AnyEvent::HTTPD->new(port => $port, allowed_methods => [qw(GET HEAD POST PUT PATCH)]);
+my $httpd = AnyEvent::HTTPD->new(port => $port, host=>$ENV{JMAP_HOST} // '0.0.0.0',
+  allowed_methods => [qw(GET HEAD POST PUT PATCH)]);
 
 $httpd->reg_cb(request => sub { $stat{http_requests}++ });
 
@@ -4550,6 +4648,18 @@ sub mgmt_healthz {
     })]);
 }
 
+sub mgmt_readyz {
+  my ($httpd, $req) = @_;
+  observe_cgroup_memory();
+  my $report = $runtime_health->readiness(accounts=>\%registered_accounts,
+    discovered=>$accounts_discovered, sync_times=>\%sync_times, now=>time(),
+    policy=>$runtime_policy, max_sync_age=>$ENV{JMAP_READY_SYNC_AGE} // 120,
+    max_request_age=>$ENV{JMAP_READY_REQUEST_AGE} // 120,
+    min_free_bytes=>$ENV{JMAP_MIN_FREE_BYTES} // 1_073_741_824);
+  $req->respond([$report->{ready} ? 200 : 503, $report->{ready} ? 'ready' : 'not ready',
+    {'Content-Type'=>'application/json'}, JSON::XS::encode_json($report)]);
+}
+
 sub mgmt_metrics {
   my ($httpd, $req) = @_;
 
@@ -4561,8 +4671,7 @@ sub mgmt_metrics {
   my $sse     = 0; for my $m (values %PushMap) { $sse += scalar keys %$m }
   my $bf      = scalar keys %backfilling;
 
-  my $total_backend_cmds = 0;
-  $total_backend_cmds += $_->[1] for values %backend;
+  my $total_backend_cmds = $runtime_health->{requests};
 
   my @out;
   my $g = sub {  # gauge
@@ -4597,10 +4706,32 @@ sub mgmt_metrics {
     push @out, '# HELP jmap_account_last_sync_age_seconds Seconds since last successful sync per account';
     push @out, '# TYPE jmap_account_last_sync_age_seconds gauge';
     for my $aid (sort keys %sync_times) {
-      my $label = $aid =~ s/"/\\"/gr;
+      my $label = Digest::SHA::sha256_hex($aid);
       push @out, "jmap_account_last_sync_age_seconds{accountid=\"$label\"} " . ($now - $sync_times{$aid});
     }
   }
+
+  push @out, $runtime_health->metrics();
+  $g->('jmap_backend_oldest_request_seconds', 'Age of oldest admitted request', $runtime_policy->oldest_age());
+  $g->('jmap_cache_disk_free_bytes', 'Free space on the data filesystem', $runtime_health->{free_bytes})
+    if defined $runtime_health->{free_bytes};
+  for my $pid (keys %worker_names) {
+    if (open my $status, '<', "/proc/$pid/status") {
+      local $/; my $data = <$status>; close $status;
+      my ($rss) = $data =~ /^VmRSS:\s+(\d+)/m;
+      my ($swap) = $data =~ /^VmSwap:\s+(\d+)/m;
+      my $role = JMAP::RuntimePolicy::role($worker_names{$pid});
+      push @out, qq{jmap_worker_resident_bytes{role="$role",pid="$pid"} } . (1024 * ($rss // 0)),
+        qq{jmap_worker_swap_bytes{role="$role",pid="$pid"} } . (1024 * ($swap // 0));
+    }
+  }
+  if (open my $events, '<', '/sys/fs/cgroup/memory.events') {
+    while (<$events>) {
+      push @out, "jmap_cgroup_memory_$1\_total $2" if /^(oom|oom_kill) (\d+)/;
+    }
+    close $events;
+  }
+  observe_cgroup_memory();
 
   $req->respond([200, 'ok',
     { 'Content-Type' => 'text/plain; version=0.0.4; charset=utf-8' },
@@ -4611,6 +4742,7 @@ $mgmt->reg_cb(request => sub { $stat{mgmt_requests}++ });
 
 $mgmt->reg_cb(
   '/healthz' => \&mgmt_healthz,
+  '/readyz'  => \&mgmt_readyz,
   '/metrics' => \&mgmt_metrics,
   '/api'     => \&mgmt_api_accounts,
   '/'        => \&mgmt_dashboard,
@@ -4621,7 +4753,7 @@ warn "Management UI on http://$mgmt_host:$mgmt_port/\n";
 #
 # Idle timeout: reap backend children that haven't been used recently
 #
-my $idle_timeout = $ENV{JMAP_IDLE_TIMEOUT} || 300;  # seconds, 0 to disable
+my $idle_timeout = $ENV{JMAP_IDLE_TIMEOUT} // 300;  # seconds, 0 to disable
 my $idle_timer;
 if ($idle_timeout) {
   $idle_timer = AnyEvent->timer(
@@ -4726,9 +4858,10 @@ sub _ensure_idle {
 # until backfill() returns false (nothing left to backfill). Mirrors
 # server.pl's prod_backfill() which uses "$accountid:backfill" as the
 # backend name to guarantee a separate process from the sync/jmap worker.
+my %backfill_retry;
 sub prod_backfill {
   my ($accountid) = @_;
-  return if $backfilling{$accountid};
+  return if $shutting_down || $backfilling{$accountid} || $backfill_retry{$accountid};
   $backfilling{$accountid} = 1;
 
   my $do_backfill;
@@ -4748,6 +4881,12 @@ sub prod_backfill {
       }
     }, sub {
       delete $backfilling{$accountid};
+      # needs_backfill remains durable in accounts.sqlite3. Retry without
+      # restarting the entire bridge, and keep one bounded timer per account.
+      $backfill_retry{$accountid} = AnyEvent->timer(after => 30 + rand(30), cb => sub {
+        delete $backfill_retry{$accountid};
+        prod_backfill($accountid) if $registered_accounts{$accountid} && !$shutting_down;
+      });
     });
   };
   $do_backfill->();
@@ -4781,6 +4920,16 @@ sub schedule_send {
   });
 }
 
+sub track_registered_accounts {
+  my ($accounts) = @_;
+  %registered_accounts = map {$_->{accountid} => 1} grep {($_->{type} // '') ne 'jmap'} @$accounts;
+  $accounts_discovered = 1;
+  for my $name (keys %{$runtime_policy->{failures}}) {
+    my $aid = JMAP::Realtime::account_id($name);
+    $runtime_policy->forget($name) unless $aid eq '__accounts__' || $registered_accounts{$aid};
+  }
+}
+
 my $sync_timer = AnyEvent->timer(
   after    => $IDLE_ENABLED ? 0.1 : $SYNC_INTERVAL,
   interval => $SYNC_INTERVAL,
@@ -4789,6 +4938,7 @@ my $sync_timer = AnyEvent->timer(
     # Idle reaping of the read worker must not stop receiving mail.
     send_backend_request('__accounts__', 'list_accounts', {}, sub {
       my $accounts = shift;
+      track_registered_accounts($accounts);
       my %registered = map { $_->{accountid} => 1 } grep { ($_->{type} // '') ne 'jmap' } @$accounts;
       for my $aid (keys %idle_watch) {
         next if $registered{$aid};

@@ -4,6 +4,10 @@ Personal compatibility fork of [jmapio/jmap-perl](https://github.com/jmapio/jmap
 See [FORK.md](FORK.md) for supported changes, tested releases, updates and rollback.
 Published images: `ghcr.io/eugeneyvt/jmap-proxy` (`stable`, version tags, `edge`).
 
+Local, unpublished work for the first reliability stage is described in
+[stage1-reliability.md](docs/stage1-reliability.md). It includes a schema change
+and must not be deployed with the existing image-only controller unchanged.
+
 The upstream README follows. Its feature claims are not a guarantee of Frappe
 Suite interoperability; the acceptance limits in FORK.md apply to this fork.
 

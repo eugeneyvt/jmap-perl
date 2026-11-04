@@ -32,6 +32,9 @@ use Text::JSContact qw(vcard_to_jscontact jscontact_to_vcard);
 use MIME::Base64 qw(encode_base64 decode_base64);
 use Scalar::Util qw(weaken);
 use Data::JSEmail;
+use JMAP::AtomicFile;
+use JMAP::Telemetry;
+use JMAP::SQLProfile;
 
 my $json = JSON::XS->new->utf8->canonical();
 
@@ -60,7 +63,11 @@ sub new {
   my $class = shift;
   my $accountid = shift || die;
   my $Self = bless { accountid => $accountid, start => time() }, ref($class) || $class;
-  my $dbh = DBI->connect("dbi:SQLite:dbname=$DATADIR/$accountid.sqlite3");
+  # Schema initialization is shared by API/sync/IDLE workers too. Serialize it
+  # with normal account transactions before enabling a new schema version.
+  my $initializing = IO::LockedFile->new(">$DATADIR/$accountid.lock") or die "Account initialization lock unavailable\n";
+  my $dbh = DBI->connect("dbi:SQLite:dbname=$DATADIR/$accountid.sqlite3", undef, undef,
+    {RaiseError=>1, PrintError=>0});
   $Self->_initdb($dbh);
   return $Self;
 }
@@ -68,14 +75,14 @@ sub new {
 sub _acct_dir {
   my ($Self) = @_;
   my $dir = "$DATADIR/" . $Self->accountid;
-  mkdir $dir unless -d $dir;
+  JMAP::AtomicFile->ensure_directory($dir);
   return $dir;
 }
 
 sub _subdir_path {
   my ($Self, $subdir, $key) = @_;
   my $dir = $Self->_acct_dir . "/$subdir";
-  mkdir $dir unless -d $dir;
+  JMAP::AtomicFile->ensure_directory($dir);
   return "$dir/$key";
 }
 
@@ -91,8 +98,7 @@ sub read_subdir {
 sub write_subdir {
   my ($Self, $subdir, $key, $data) = @_;
   my $path = $Self->_subdir_path($subdir, $key);
-  open my $fh, '>:raw', $path or die "Cannot write $path: $!";
-  print $fh $data; close $fh;
+  JMAP::Telemetry::measure('cache_write', sub { JMAP::AtomicFile->replace($path, $data) });
 }
 
 sub unlink_subdir {
@@ -100,7 +106,16 @@ sub unlink_subdir {
   unlink $Self->_subdir_path($subdir, $key);
 }
 
-sub read_parsed_msg     { my $b = $_[0]->read_subdir('parsed',   "$_[1].json"); defined $b ? decode_json($b) : undef }
+sub read_parsed_msg {
+  my $b = $_[0]->read_subdir('parsed', "$_[1].json");
+  return undef unless defined $b;
+  my $parsed = eval { decode_json($b) };
+  return $parsed if ref($parsed) eq 'HASH';
+  # This is a disposable parsed cache, not the original mailbox. A corrupt
+  # value is a cache miss; do not echo its content or delete the original file.
+  JMAP::Telemetry::increment('cache_corrupt');
+  return undef;
+}
 sub write_parsed_msg    { $_[0]->write_subdir('parsed',   "$_[1].json", $json->encode($_[2])) }
 
 sub read_upload_blob    { $_[0]->read_subdir('files',    $_[1]) }
@@ -171,7 +186,9 @@ sub in_transaction {
 sub begin_superlock {
   my $Self = shift;
   my $accountid = $Self->accountid();
-  my $lock = IO::LockedFile->new(">$DATADIR/$accountid.lock");
+  my $started = JMAP::Telemetry::now();
+  my $lock = IO::LockedFile->new(">$DATADIR/$accountid.lock") or die "Account lock unavailable\n";
+  JMAP::Telemetry::record('lock', JMAP::Telemetry::now() - $started);
   $Self->{superlock} = $lock;
   weaken $Self->{superlock};
   return $lock;
@@ -182,8 +199,15 @@ sub begin {
   confess("ALREADY IN TRANSACTION") if $Self->{t};
   my $accountid = $Self->accountid();
   # we need this because sqlite locking isn't as robust as you might hope
-  $Self->{t} = {lock => $Self->{superlock} || IO::LockedFile->new(">$DATADIR/$accountid.lock")};
-  $Self->{t}{dbh} = DBI->connect("dbi:SQLite:dbname=$DATADIR/$accountid.sqlite3");
+  my $started = JMAP::Telemetry::now();
+  my $lock = $Self->{superlock} || IO::LockedFile->new(">$DATADIR/$accountid.lock")
+    or die "Account lock unavailable\n";
+  $Self->{t} = {lock => $lock};
+  JMAP::Telemetry::record('lock', JMAP::Telemetry::now() - $started);
+  $Self->{t}{started} = JMAP::Telemetry::now();
+  $Self->{t}{dbh} = DBI->connect("dbi:SQLite:dbname=$DATADIR/$accountid.sqlite3", undef, undef,
+    {RaiseError=>1, PrintError=>0});
+  $Self->{t}{dbh}{Profile} = JMAP::SQLProfile->new();
   $Self->{t}{dbh}->begin_work();
 }
 
@@ -209,7 +233,8 @@ sub commit {
       $Self->dmaybedirty('jmailboxes', \%update, {jmailboxid => $jmailboxid});
     }
   }
-  if ($t->{modseq} and $Self->{change_cb}) {
+  my ($notify, $notify_state);
+  if ($t->{modseq}) {
     my %map;
     my %dbdata = (jhighestmodseq => $t->{modseq});
     my $state = "$t->{modseq}";
@@ -221,17 +246,29 @@ sub commit {
     }
 
     $Self->dupdate('account', \%dbdata);
-    $Self->{change_cb}->($Self, \%map, $state) unless $Self->{t}->{backfilling};
+    ($notify, $notify_state) = (\%map, $state) unless $t->{backfilling};
   }
 
-  $Self->{t}{dbh}->commit();
+  $Self->{t}{dbh}->commit() or die "Database commit failed\n";
+  $Self->{t}{dbh}{Profile}->collect();
   delete $Self->{t};
+  JMAP::Telemetry::record('transaction', JMAP::Telemetry::now() - $t->{started}) if $t->{started};
+  # Drop the coarse lock before notifying a reader. Failure to publish after a
+  # successful commit is a notification failure, never a rolled-back mutation.
+  delete $t->{lock};
+  if ($notify && $Self->{change_cb}) {
+    eval { $Self->{change_cb}->($Self, $notify, $notify_state); 1 } or do {
+      JMAP::Telemetry::increment('notification_failed');
+      warn "Post-commit notification failed; reconnect must reconcile state\n";
+    };
+  }
 }
 
 sub rollback {
   my $Self = shift;
   confess("NOT IN TRANSACTION") unless $Self->{t};
   $Self->{t}{dbh}->rollback();
+  $Self->{t}{dbh}{Profile}->collect() if $Self->{t}{dbh}{Profile};
   delete $Self->{t};
 }
 
@@ -240,6 +277,7 @@ sub reset {
   my $Self = shift;
   return unless $Self->{t};
   $Self->{t}{dbh}->rollback() if $Self->{t}{dbh};
+  $Self->{t}{dbh}{Profile}->collect() if $Self->{t}{dbh} && $Self->{t}{dbh}{Profile};
   delete $Self->{t};
 }
 
@@ -1226,7 +1264,7 @@ sub get_submission_changes {
     {}, $since_modseq);
 }
 
-my $USER_SCHEMA_VERSION = 12;
+my $USER_SCHEMA_VERSION = 13;
 
 sub save_query {
   my ($Self, $type, $params, $state, $ids) = @_;
@@ -1258,6 +1296,7 @@ sub load_query {
 
 sub _create_user_tables {
   my ($Self, $dbh) = @_;
+  $Self->_create_delivery_journal($dbh);
   # All CREATE TABLE statements for the current schema version.
   # When bumping $USER_SCHEMA_VERSION, update these to the new target schema
   # and add an incremental migration block in _initdb below.
@@ -1767,6 +1806,42 @@ EOF
     if ($@) { $dbh->rollback; die "user DB migration to v12 failed: $@" }
     $v = 12;
   }
+
+  if ($v < 13) {
+    $dbh->begin_work;
+    eval {
+      $Self->_create_delivery_journal($dbh);
+      # Historical pending sends have no durable attempt journal. They may
+      # have been accepted before the old worker died: require reconciliation.
+      $dbh->do("INSERT INTO jdelivery (jsubid,state,updated,error_code)
+        SELECT jsubid,'unknown',strftime('%s','now'),'legacy_pending'
+        FROM jsubmission WHERE undoStatus='pending'") or die "Delivery migration failed\n";
+      my ($pending) = $dbh->selectrow_array("SELECT count(*) FROM jsubmission WHERE undoStatus='pending'");
+      if ($pending) {
+        my ($modseq) = $dbh->selectrow_array('SELECT jhighestmodseq FROM account');
+        $modseq = ($modseq // 1) + 1;
+        $dbh->do("UPDATE jsubmission SET undoStatus='final',jmodseq=?,mtime=strftime('%s','now')
+          WHERE undoStatus='pending'", {}, $modseq) or die "Legacy pending quarantine failed\n";
+        $dbh->do('UPDATE account SET jhighestmodseq=?,jstateEmailSubmission=?', {}, $modseq, "$modseq")
+          or die "Legacy pending state update failed\n";
+      }
+      $dbh->do('PRAGMA user_version = 13') or die "Delivery migration version failed\n";
+      $dbh->commit or die "Delivery migration commit failed\n";
+    };
+    if ($@) { $dbh->rollback; die "user DB migration to v13 failed\n" }
+  }
+}
+
+sub _create_delivery_journal {
+  my ($Self, $dbh) = @_;
+  $dbh->do("CREATE TABLE IF NOT EXISTS jdelivery (
+    jsubid TEXT PRIMARY KEY, state TEXT NOT NULL, fingerprint TEXT,
+    body_sha256 TEXT, owner_pid INTEGER, attempt TEXT, updated INTEGER NOT NULL, error_code TEXT
+  )") or die "Delivery journal creation failed\n";
+  $dbh->do('CREATE INDEX IF NOT EXISTS jdeliverystate ON jdelivery(state,updated)')
+    or die "Delivery state index creation failed\n";
+  $dbh->do('CREATE INDEX IF NOT EXISTS jdeliveryfingerprint ON jdelivery(fingerprint)')
+    or die "Delivery fingerprint index creation failed\n";
 }
 
 1;

@@ -21,7 +21,7 @@ $db->write_subdir('outbox',"$id.eml",'synthetic original');
 $db=JMAP::ImapDB->new('legacy');
 $db->begin();
 my ($v)=$db->dbh->selectrow_array('PRAGMA user_version');
-is($v,13,'v12 migration advances version only with journal present');
+is($v,14,'v12 migration reaches current version with journal present');
 my $row=$db->dbh->selectrow_hashref('SELECT state,error_code FROM jdelivery WHERE jsubid=?',{},$id);
 is($row->{state},'unknown','legacy pending delivery is quarantined, not presumed unsent');
 is($row->{error_code},'legacy_pending','reason for review persists');

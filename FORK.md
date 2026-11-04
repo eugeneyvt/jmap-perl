@@ -58,6 +58,12 @@ private readiness/metrics and a durable SMTP-attempt journal (schema v13).
 The v0.2.3 deployment remains unchanged. Review the migration and rollback gates;
 the image-only update/rollback instructions below do not authorize this migration.
 
+**Stacked unpublished candidate:** [stage 2 SQL queries](docs/stage2-query-planner.md)
+adds bounded row snapshots, SQL pagination/diffs, batched provider UID mapping,
+read/write transactions and persistent list summaries (schema v14). Suite list
+callers need the separately prepared summary-only application change to avoid
+requesting full bodies. Neither candidate is a production release.
+
 Images are published to `ghcr.io/eugeneyvt/jmap-proxy`:
 
 | Tag | Meaning |

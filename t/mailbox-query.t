@@ -14,6 +14,7 @@ use JMAP::API;
   package GeneralQueryAPI;
   use parent 'JMAP::API';
   sub _mailbox_query_rows { undef }
+  sub _email_query_plan { undef }
 }
 
 my $db = JMAP::ImapDB->new('query');
@@ -49,7 +50,7 @@ my $general = GeneralQueryAPI->new($db);
 sub args {
   return {accountId=>'query',filter=>{inMailbox=>'inbox'},
     sort=>[{property=>'receivedAt',isAscending=>JSON::XS::false}],
-    collapseThreads=>JSON::XS::true,@_};
+    collapseThreads=>JSON::XS::true,calculateTotal=>JSON::XS::true,@_};
 }
 sub response {
   my ($client,$params)=@_;
@@ -76,7 +77,9 @@ for my $case (@cases) {
   is_deeply($reply->[1]{ids},$ids,"$label returns the expected IDs and order");
   is($reply->[1]{position},$position,"$label position");
   is($reply->[1]{total},$total,"$label total");
-  is_deeply($reply,response($general,$params),"$label matches the general query response");
+  my $legacy=response($general,$params);
+  my $normalized=[@$reply]; $normalized->[1]={%{$reply->[1]},queryState=>$legacy->[1]{queryState}};
+  is_deeply($normalized,$legacy,"$label matches the independent general query response");
 }
 
 $api->setid('folder','inbox');
@@ -86,9 +89,9 @@ is(response($api,args(anchor=>'absent'))->[1]{type},'anchorNotFound','missing an
 
 # The query cache is a full ordered result, even if the caller requested one row.
 my $paged=response($api,args(limit=>1));
-my $cached=$db->load_query('Email',{
-  filter=>{inMailbox=>'inbox'},sort=>[{property=>'receivedAt',isAscending=>JSON::XS::false}],
-  collapseThreads=>1},$paged->[1]{queryState});
+$db->begin_read;
+my $cached=$db->dbh->selectcol_arrayref('SELECT msgid FROM jemailqueryrows WHERE querykey=(SELECT querykey FROM jemailqueries WHERE state=?) ORDER BY position',{},$paged->[1]{queryState});
+$db->commit;
 is_deeply($cached,['m2','m4','m3','m9'],'query state retains the full result for queryChanges');
 my $changes=$api->api_Email_queryChanges(args(sinceQueryState=>$paged->[1]{queryState}));
 is_deeply($changes->[1]{removed},[],'unchanged query removes nothing');
@@ -103,6 +106,8 @@ for my $params (
   args(sort=>[{property=>'subject',isAscending=>JSON::XS::false}]),
   args(sort=>[{property=>'receivedAt'},{property=>'id'}]),
 ) {
-  is_deeply(response($api,$params),response($general,$params),'general filters/sorts retain their original behavior');
+  my $actual=response($api,$params);my $expected=response($general,$params);
+  $actual->[1]{queryState}=$expected->[1]{queryState};
+  is_deeply($actual,$expected,'general filters/sorts retain their original behavior');
 }
 done_testing();

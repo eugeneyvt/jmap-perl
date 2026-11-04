@@ -10,6 +10,8 @@ use Encode;
 use HTML::GenerateUtil qw(escape_html);
 use Date::Parse;
 use B ();
+use JMAP::QueryPlanner;
+use JMAP::QueryStore;
 
 my $json = JSON::XS->new->utf8->canonical();
 
@@ -37,7 +39,7 @@ sub _post_sort {
       my $map = $fieldmap{$field};
       if ($map) {
         if ($map->[1]) {
-          $res = $a->{$map->[0]} <=> $b->{$map->[0]};
+          $res = ($a->{$map->[0]} // 0) <=> ($b->{$map->[0]} // 0);
         }
         else {
           $res = JMAP::Collation::compare($arg->{collation}, $a->{$map->[0]}, $b->{$map->[0]},
@@ -409,9 +411,29 @@ sub _mailbox_query_rows {
   return $rows;
 }
 
+sub _email_query_plan {
+  my ($Self,$args)=@_;
+  return JMAP::QueryPlanner->compile($args, sub {$Self->idmap($_[0])});
+}
+
+sub _sql_email_result {
+  my ($Self,$args,$plan,$changes)=@_;
+  return ['error',{type=>'accountNotFound'}]
+    if $args->{accountId} && $args->{accountId} ne $Self->{db}->accountid;
+  my $store=JMAP::QueryStore->new($Self,$args,$plan);
+  my $result=eval {$changes ? $store->changes(_query_uses_mutable($args->{filter},$args->{sort})) : $store->query};
+  if ($@) {my $error=$@;$Self->{db}->reset;die $error}
+  return ['error',$result->{error}] if $result->{error};
+  return [$changes ? 'Email/queryChanges' : 'Email/query',$result];
+}
+
 sub api_Email_query {
   my $Self = shift;
   my $args = shift;
+
+  if (my $plan=$Self->_email_query_plan($args)) {
+    return $Self->_sql_email_result($args,$plan,0);
+  }
 
   my ($user, $accountid) = $Self->_api_init($args);
   return $Self->_transError(['error', {type => 'accountNotFound'}]) unless defined $accountid;
@@ -466,7 +488,7 @@ sub api_Email_query {
     $start = 0 if $start < 0;
   }
 
-  my $end = $args->{limit} ? $start + $args->{limit} - 1 : $#$data;
+  my $end = defined($args->{limit}) ? $start + $args->{limit} - 1 : $#$data;
   $end = $#$data if $end > $#$data;
 
   my @result = map { $data->[$_]{msgid} } $start..$end;
@@ -480,7 +502,7 @@ sub api_Email_query {
     queryState => $newQueryState,
     canCalculateChanges => $JSON::true,
     position => $start,
-    total => scalar(@$data),
+    ($args->{calculateTotal} ? (total => scalar(@$data)) : ()),
     ids => [map { "$_" } @result],
   }];
 
@@ -495,19 +517,31 @@ my %MUTABLE_EMAIL_CONDITION = map { $_ => 1 } qw(
 );
 sub _query_uses_mutable {
   my ($filter, $sort) = @_;
-  return 1 if grep { ref $_ eq 'HASH' && ($_->{property} // '') =~ /Keyword$/ } @{$sort || []};
+  my $mutable=0;
+  for my $arg (@{$sort || []}) {
+    next unless ref($arg) eq 'HASH';
+    return 2 if ($arg->{property} // '') =~ /InThreadHaveKeyword$/;
+    $mutable=1 if ($arg->{property} // '') eq 'hasKeyword';
+  }
   my @todo = ($filter);
   while (my $f = shift @todo) {
     next unless ref $f eq 'HASH';
     push @todo, @{$f->{conditions} || []} if exists $f->{operator};
-    return 1 if grep { $MUTABLE_EMAIL_CONDITION{$_} } keys %$f;
+    return 2 if grep { /InThreadHaveKeyword$/ } keys %$f;
+    $mutable=1 if grep { $MUTABLE_EMAIL_CONDITION{$_} } keys %$f;
   }
-  return 0;
+  return $mutable;
 }
 
 sub api_Email_queryChanges {
   my $Self = shift;
   my $args = shift;
+
+  return ['error',{type=>'invalidArguments',arguments=>['sinceQueryState']}]
+    unless $args->{sinceQueryState};
+  if (my $plan=$Self->_email_query_plan($args)) {
+    return $Self->_sql_email_result($args,$plan,1);
+  }
 
   my ($user, $accountid) = $Self->_api_init($args);
   return $Self->_transError(['error', {type => 'accountNotFound'}]) unless defined $accountid;
@@ -584,7 +618,7 @@ sub api_Email_get {
   my $Self = shift;
   my $args = shift;
 
-  my ($user, $accountid) = $Self->_api_init($args);
+  my ($user, $accountid) = $Self->_api_init($args,1);
   return $Self->_transError(['error', {type => 'accountNotFound'}]) unless defined $accountid;
 
   my $newState = "$user->{jstateEmail}";
@@ -614,15 +648,32 @@ sub api_Email_get {
   my %missingids;
   my @list;
   my $need_content = 0;
-  foreach my $prop (qw(hasAttachment headers preview textBody htmlBody attachments bodyValues bodyStructure messageId inReplyTo references sender)) {
+  foreach my $prop (qw(hasAttachment headers preview textBody htmlBody attachments bodyValues bodyStructure messageId inReplyTo references sender replyTo)) {
     $need_content = 1 if _prop_wanted($args, $prop);
   }
   $need_content = 1 if grep { m/^header:/ } @{$args->{properties}};
+  my @requested = map {$Self->idmap($_)} @{$args->{ids}};
+  my $records=$Self->{db}->rows_for_ids('jmessages','msgid',\@requested,'*',1);
+  my %records=map {$_->{msgid}=>$_} @$records;
+  my %membership;
+  if (_prop_wanted($args,'mailboxIds')) {
+    for my $r (@{$Self->{db}->rows_for_ids('jmessagemap','msgid',\@requested,'msgid,jmailboxid',1)}) {
+      $membership{$r->{msgid}}{$r->{jmailboxid}}=$JSON::true;
+    }
+  }
+  my %summaries;
+  if ($need_content) {
+    for my $r (@{$Self->{db}->rows_for_ids('jemailsummary','msgid',\@requested,'msgid,payload',0)}) {
+      my $s=eval {decode_json($r->{payload})};
+      $summaries{$r->{msgid}}=$s if ref($s) eq 'HASH' &&
+        !grep {!exists $s->{$_}} qw(preview hasAttachment messageId inReplyTo references sender replyTo attachments);
+    }
+  }
   my %msgidmap;
   foreach my $msgid (map { $Self->idmap($_) } @{$args->{ids}}) {
     next if $seenids{$msgid};
     $seenids{$msgid} = 1;
-    my $data = $Self->{db}->dgetone('jmessages', { msgid => $msgid, active => 1 });
+    my $data = $records{$msgid};
     unless ($data) {
       $missingids{$msgid} = 1;
       next;
@@ -638,8 +689,7 @@ sub api_Email_get {
     }
 
     if (_prop_wanted($args, 'mailboxIds')) {
-      my $ids = $Self->{db}->dgetcol('jmessagemap', { msgid => $msgid, active => 1 }, 'jmailboxid');
-      $item->{mailboxIds} = {map { $_ => $JSON::true } @$ids};
+      $item->{mailboxIds} = $membership{$msgid} || {};
     }
 
     if (_prop_wanted($args, 'inReplyToEmailId')) {
@@ -692,7 +742,12 @@ sub api_Email_get {
     # RFC 8621 Section 4.2: default bodyProperties
     my $bodyProperties = $args->{bodyProperties} || [qw(partId blobId size name type charset disposition cid language location)];
 
-    my $content = $Self->{db}->fill_messages(map { $_->{id} } @list);
+    my %summary_properties=map {$_=>1} qw(preview hasAttachment messageId inReplyTo references sender replyTo attachments);
+    my $needs_body=grep { ! $summary_properties{$_} &&
+      ($_ =~ /^header:/ || $_ =~ /^(?:headers|textBody|htmlBody|attachments|bodyValues|bodyStructure)$/) } @{$args->{properties}};
+    my @missing = map {$_->{id}} grep {$needs_body || !$summaries{$_->{id}}} @list;
+    my $loaded = @missing ? $Self->{db}->fill_messages(@missing) : {};
+    my $content={%summaries,%$loaded};
     foreach my $item (@list) {
       my $data = $content->{$item->{id}};
       if (_prop_wanted($args, 'preview')) {

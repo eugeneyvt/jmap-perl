@@ -3344,7 +3344,7 @@ sub _imap_search_into {
     }
     # One indexed join per folder, instead of one metadata query per UID.
     $dbh->do('INSERT OR IGNORE INTO temp.jmap_provider_hits(term,msgid)
-      SELECT ?,i.msgid FROM imessages i JOIN temp.jmap_provider_uids u ON u.uid=i.uid
+      SELECT ?,i.msgid FROM temp.jmap_provider_uids u CROSS JOIN imessages i ON i.uid=u.uid
       WHERE i.ifolderid=? AND i.msgid IS NOT NULL',{},$term,$item->{ifolderid});
     $Self->commit();
   }

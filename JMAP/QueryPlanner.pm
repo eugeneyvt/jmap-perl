@@ -50,8 +50,21 @@ sub compile {
   my $projection = join(',', 'm.msgid', 'm.thrid', @columns);
   my $required=$self->_required_terms($args->{filter});
   my ($first)=sort {$a<=>$b} keys %$required;
-  my $from=defined($first) ? "temp.jmap_provider_hits ph CROSS JOIN jmessages m ON m.msgid=ph.msgid" : 'jmessages m';
-  my $restrict=defined($first) ? "ph.term=$first AND " : '';
+  my ($mailbox)=sort keys %{$self->_required_mailboxes($args->{filter})};
+  my (@driver_binds,$from,$restrict);
+  if (defined $first) {
+    $from='temp.jmap_provider_hits ph CROSS JOIN jmessages m ON m.msgid=ph.msgid';
+    $restrict="ph.term=$first AND ";
+  }
+  elsif (defined $mailbox) {
+    $self->{driving_mailbox}=$mailbox;
+    $self->{filter_binds}=[];
+    $where=$self->_filter($args->{filter});
+    $from='jmessagemap member INDEXED BY jemailmembership CROSS JOIN jmessages m ON m.msgid=member.msgid';
+    $restrict='member.active=1 AND member.jmailboxid=? AND ';
+    @driver_binds=($mailbox);
+  }
+  else {$from='jmessages m';$restrict=''}
   my $sql = "WITH candidates AS(SELECT $projection FROM $from WHERE ${restrict}m.active=1 AND ($where))";
   if ($args->{collapseThreads}) {
     $sql .= ", representatives AS(SELECT *,ROW_NUMBER() OVER(PARTITION BY COALESCE(thrid,'') ORDER BY $order) AS representative FROM candidates)";
@@ -59,7 +72,7 @@ sub compile {
   }
   else { $sql .= " SELECT ROW_NUMBER() OVER(ORDER BY $order)-1 AS position,msgid FROM candidates" }
   $self->{sql} = $sql;
-  $self->{binds} = [@{$self->{sort_binds}}, @{$self->{filter_binds}}];
+  $self->{binds} = [@{$self->{sort_binds}}, @driver_binds, @{$self->{filter_binds}}];
   delete $self->{idmap};
   return $self;
 }
@@ -67,12 +80,12 @@ sub compile {
 # Only a logically necessary positive provider term may narrow the candidate
 # universe. OR intersects necessities; NOT never narrows it. Thread predicates
 # continue to use the complete jmessages universe in their correlated subquery.
-sub _required_terms {
-  my ($self,$filter)=@_;
+sub _required_values {
+  my ($self,$filter,$leaf)=@_;
   return {} unless ref($filter) eq 'HASH';
   if ($filter->{operator}) {
     return {} if $filter->{operator} eq 'NOT';
-    my @sets=map {$self->_required_terms($_)} @{$filter->{conditions}};
+    my @sets=map {$self->_required_values($_,$leaf)} @{$filter->{conditions}};
     return {} unless @sets;
     my %terms=%{shift @sets};
     for my $set (@sets) {
@@ -81,15 +94,30 @@ sub _required_terms {
     }
     return \%terms;
   }
-  my %terms;
-  for my $key (qw(text from to cc bcc subject body header)) {
-    next unless $filter->{$key};
-    my @search=$key eq 'header' ? ($key,@{$filter->{$key}}) : ($key,$filter->{$key});
-    push @search,'' if $key eq 'header' && @search==2;
-    my $index=$self->{term_map}{JSON::XS->new->canonical->encode(\@search)};
-    $terms{$index}=1 if defined $index;
-  }
-  return \%terms;
+  return $leaf->($filter);
+}
+
+sub _required_terms {
+  my ($self,$filter)=@_;
+  return $self->_required_values($filter,sub {
+    my ($f)=@_;my %terms;
+    for my $key (qw(text from to cc bcc subject body header)) {
+      next unless $f->{$key};
+      my @search=$key eq 'header' ? ($key,@{$f->{$key}}) : ($key,$f->{$key});
+      push @search,'' if $key eq 'header' && @search==2;
+      my $index=$self->{term_map}{JSON::XS->new->canonical->encode(\@search)};
+      $terms{$index}=1 if defined $index;
+    }
+    return \%terms;
+  });
+}
+
+sub _required_mailboxes {
+  my ($self,$filter)=@_;
+  return $self->_required_values($filter,sub {
+    my ($f)=@_;
+    return $f->{inMailbox} ? {$self->{idmap}->($f->{inMailbox})=>1} : {};
+  });
 }
 
 sub _filter {
@@ -115,6 +143,7 @@ sub _filter {
     # Match the legacy truthy checks, including ignored empty search strings.
     next unless $value || $key eq 'hasAttachment';
     if ($key eq 'inMailbox') {
+      next if defined($self->{driving_mailbox}) && $self->{idmap}->($value) eq $self->{driving_mailbox};
       push @parts, 'EXISTS(SELECT 1 FROM jmessagemap mm WHERE mm.msgid=m.msgid AND mm.active=1 AND mm.jmailboxid=?)';
       push @{$self->{filter_binds}}, $self->{idmap}->($value);
     }

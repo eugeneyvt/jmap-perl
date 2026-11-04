@@ -38,13 +38,19 @@ my @filters=(undef,{}, {inMailbox=>'inbox'}, {inMailbox=>'absent'},
   {operator=>'OR',conditions=>[{inMailbox=>'inbox'},{hasAttachment=>JSON::XS::true}]},
   {operator=>'NOT',conditions=>[{hasKeyword=>'$seen'},{inMailbox=>'other'}]},
   {operator=>'AND',conditions=>[{inMailbox=>'inbox'},{someInThreadHaveKeyword=>'$seen'}]},
-  {operator=>'AND',conditions=>[]},{operator=>'OR',conditions=>[]},{operator=>'NOT',conditions=>[]});
+  {operator=>'AND',conditions=>[]},{operator=>'OR',conditions=>[]},{operator=>'NOT',conditions=>[]},
+  {operator=>'AND',conditions=>[{inMailbox=>'inbox'},{operator=>'OR',conditions=>[
+    {operator=>'NOT',conditions=>[{inMailbox=>'inbox'}]},{hasKeyword=>'$flagged'}]}]},
+  {operator=>'OR',conditions=>[
+    {operator=>'AND',conditions=>[{inMailbox=>'inbox'},{hasKeyword=>'$seen'}]},
+    {operator=>'AND',conditions=>[{inMailbox=>'inbox'},{hasKeyword=>'$flagged'}]}]},
+  {operator=>'AND',conditions=>[{inMailbox=>'inbox'},{inMailbox=>'both'}]});
 my @sorts=([{property=>'receivedAt',isAscending=>JSON::XS::false}],[{property=>'receivedAt'}],
   [{property=>'sentAt'},{property=>'size',isAscending=>JSON::XS::false}],
   [{property=>'subject',collation=>'i;unicode-casemap'}],[{property=>'from',collation=>'i;octet'}],
   [{property=>'to',collation=>'i;ascii-casemap'}],[{property=>'hasKeyword',keyword=>'$seen'}],
   [{property=>'allInThreadHaveKeyword',keyword=>'$seen'}],[{property=>'someInThreadHaveKeyword',keyword=>'$flagged'}],[]);
-for my $i (0..209) {
+for my $i (0..(@filters*@sorts-1)) {
   my $args={accountId=>'planner',filter=>$filters[$i%@filters],sort=>$sorts[int($i/@filters)%@sorts],
     collapseThreads=>$i%2 ? JSON::XS::true : JSON::XS::false,calculateTotal=>JSON::XS::true,
     position=>($i%5)-2,limit=>$i%8};

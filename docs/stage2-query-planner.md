@@ -111,7 +111,7 @@ change requires its own application release; it is not part of this bridge image
 
 ## Validation and rollout
 
-Tests compare SQL results against the independent legacy Perl path over 210
+Tests compare SQL results against the independent legacy Perl path over 240
 filter/sort/collapse/page combinations, and cover provider boolean logic,
 state races, UIDVALIDITY, cache freshness/bounds, SQL diffs, shared readers,
 concurrent writers/modseq, busy errors, metadata batching and summary eviction.

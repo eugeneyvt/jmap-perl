@@ -73,6 +73,12 @@ sub compile {
   else { $sql .= " SELECT ROW_NUMBER() OVER(ORDER BY $order)-1 AS position,msgid FROM candidates" }
   $self->{sql} = $sql;
   $self->{binds} = [@{$self->{sort_binds}}, @driver_binds, @{$self->{filter_binds}}];
+  my @todo=($args->{filter});
+  while (my $f=shift @todo) {
+    next unless ref($f) eq 'HASH';
+    $self->{attachment_generation}=1 if exists $f->{hasAttachment};
+    push @todo,@{$f->{conditions} || []};
+  }
   delete $self->{idmap};
   return $self;
 }

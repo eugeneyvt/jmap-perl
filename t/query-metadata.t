@@ -15,6 +15,9 @@ for my $n (1..100) {
 }
 $db->commit;
 my $api=JMAP::API->new($db);
+my $query_args={accountId=>'metadata',filter=>{inMailbox=>'inbox'},sort=>[{property=>'receivedAt'}],limit=>5};
+my $page_before=$api->api_Email_query($query_args);
+my $attachment_before=$api->api_Email_query({%$query_args,filter=>{inMailbox=>'inbox',hasAttachment=>JSON::XS::true}});
 my @ids=map {"m$_"} 1..100;
 my @properties=qw(id subject from keywords mailboxIds threadId receivedAt size);
 my $sql_count=0;my $dbh=$db->_connection;
@@ -34,6 +37,11 @@ my $parsed={preview=>'A persisted preview',hasAttachment=>JSON::XS::true,message
 $db->write_parsed_msg('m1',$parsed);
 my ($first)=$api->api_Email_get({accountId=>'metadata',ids=>['m1'],properties=>[qw(id preview hasAttachment messageId attachments)]});
 is($first->[1]{list}[0]{preview},'A persisted preview','first access fills summary from the existing parsed cache');
+my $page_after=$api->api_Email_query($query_args);
+is($page_after->[1]{queryState},$page_before->[1]{queryState},'filling an attachment preview does not invalidate an unrelated mailbox snapshot');
+my $attachment_after=$api->api_Email_query({%$query_args,filter=>{inMailbox=>'inbox',hasAttachment=>JSON::XS::true}});
+isnt($attachment_after->[1]{queryState},$attachment_before->[1]{queryState},'attachment-dependent snapshot advances when attachment metadata becomes known');
+is_deeply($attachment_after->[1]{ids},['m1'],'attachment-dependent query includes the newly known attachment');
 unlink "$ENV{JMAP_DATADIR}/metadata/parsed/m1.json" or die $!;
 {
   no warnings 'redefine';

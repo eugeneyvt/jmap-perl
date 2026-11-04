@@ -37,11 +37,12 @@ sub _base {
   my ($self)=@_;
   my $db=$self->{db};
   my $user=$db->get_user;
-  my ($generation)=$db->dbh->selectrow_array('SELECT generation FROM jemailqueryclock WHERE singleton=1');
+  my ($generation,$attachments)=$db->dbh->selectrow_array('SELECT generation,attachment_generation FROM jemailqueryclock WHERE singleton=1');
   my $folders=@{$self->{plan}{terms}} ? $db->dbh->selectall_arrayref(
     'SELECT ifolderid,uidvalidity,uidfirst,uidnext,highestmodseq FROM ifolders ORDER BY ifolderid') : [];
   my $base=sha256_hex($json->encode({email=>$user->{jstateEmail}, mailbox=>$user->{jstateMailbox},
-    generation=>$generation, account=>$db->accountid,folders=>$folders}));
+    generation=>$generation, attachments=>$self->{plan}{attachment_generation} ? $attachments : 0,
+    account=>$db->accountid,folders=>$folders}));
   return ($base, $user->{jhighestmodseq});
 }
 

@@ -1382,13 +1382,14 @@ sub cache_message_summaries {
     $statement->execute($id, _summary_payload($m), time());
     $raw->execute($id, $has, time());
   }
-  $Self->advance_search_generation if $changed;
+  $Self->dbh->do('UPDATE jemailqueryclock SET attachment_generation=attachment_generation+1 WHERE singleton=1') if $changed;
 }
 
 sub _create_email_query_tables {
   my ($Self, $dbh) = @_;
-  $dbh->do('CREATE TABLE IF NOT EXISTS jemailqueryclock(singleton INTEGER PRIMARY KEY CHECK(singleton=1),generation INTEGER NOT NULL)');
-  $dbh->do('INSERT OR IGNORE INTO jemailqueryclock VALUES(1,0)');
+  $dbh->do('CREATE TABLE IF NOT EXISTS jemailqueryclock(singleton INTEGER PRIMARY KEY CHECK(singleton=1),generation INTEGER NOT NULL,
+    attachment_generation INTEGER NOT NULL DEFAULT 0)');
+  $dbh->do('INSERT OR IGNORE INTO jemailqueryclock(singleton,generation,attachment_generation) VALUES(1,0,0)');
   $dbh->do('CREATE TABLE IF NOT EXISTS jemailsummary(msgid TEXT PRIMARY KEY,payload TEXT NOT NULL,mtime INTEGER NOT NULL)');
   $dbh->do('CREATE TABLE IF NOT EXISTS jemailqueries(querykey TEXT PRIMARY KEY,signature TEXT NOT NULL,state TEXT NOT NULL,base_state TEXT NOT NULL,
     modseq INTEGER NOT NULL,created INTEGER NOT NULL,used INTEGER NOT NULL,total INTEGER NOT NULL,bytes INTEGER NOT NULL,

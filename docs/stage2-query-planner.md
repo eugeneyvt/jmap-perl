@@ -28,8 +28,10 @@ construction avoids an extra full count on each page.
 account), resolved creation references, normalized parameters, Email/Mailbox
 state and search generation. Provider results add a digest of their matched IDs.
 Opaque `q2.` tokens deliberately differ from the old numeric query states.
-`advance_search_generation` is the storage hook for new searchable content;
-attachment discovery already uses it. No index is claimed to exist yet.
+`advance_search_generation` is the storage hook for new searchable content.
+Attachment discovery has a separate generation, included only for filters that
+depend on attachment presence: filling a preview must not invalidate an unrelated
+mailbox/provider snapshot and force another network search. No index exists yet.
 
 Rows and their advertised state are read in one transaction. Provider I/O occurs
 between transactions; a racing catalog generation causes a bounded retry, never

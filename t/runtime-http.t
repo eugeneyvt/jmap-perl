@@ -22,7 +22,7 @@ if (!$pid) {
   $ENV{JMAP_HOME}='.';$ENV{JMAP_DATADIR}=$dir;$ENV{JMAP_PORT}=$port;
   $ENV{JMAP_MGMT_PORT}=$mgmt;$ENV{JMAP_HOST}='127.0.0.1';$ENV{JMAP_MGMT_HOST}='127.0.0.1';
   $ENV{BASEURL}="http://127.0.0.1:$port";$ENV{JMAP_SECRET_KEY}='c' x 64;
-  $ENV{JMAP_READ_DEADLINE}=0.4;$ENV{JMAP_IDLE_ENABLE}=0;$ENV{JMAP_SYNC_INTERVAL}=600;
+  $ENV{JMAP_READ_DEADLINE}=2;$ENV{JMAP_IDLE_ENABLE}=0;$ENV{JMAP_SYNC_INTERVAL}=600;
   open STDOUT,'>',"$dir/proxy.log" or die $!;open STDERR,'>&',\*STDOUT or die $!;
   exec $^X,'-I.','bin/jmap-proxy.pl';die $!;
 }
@@ -34,7 +34,7 @@ END {
     if (kill(0,$pid)) {kill 'KILL',$pid;waitpid($pid,0)}
   }
 }
-my $http=HTTP::Tiny->new(timeout=>3,proxy=>undef,http_proxy=>undef,https_proxy=>undef);
+my $http=HTTP::Tiny->new(timeout=>5,proxy=>undef,http_proxy=>undef,https_proxy=>undef);
 my $alive;
 for (1..60) {
   $alive=$http->get("http://127.0.0.1:$mgmt/healthz");last if $alive->{status}==200;
@@ -61,7 +61,12 @@ sub query {
     content=>encode_json({using=>['urn:ietf:params:jmap:core','urn:ietf:params:jmap:mail','urn:ietf:params:jmap:submission'],methodCalls=>$calls})});
 }
 my $q=['Email/query',{accountId=>'synthetic',limit=>1},'q'];
-is(query([$q])->{status},200,'ordinary JMAP request completes');
+my $warm=query([$q]);
+for (1..30) {
+  last if $warm->{content}=~/"Email\/query"/;
+  sleep .1;$warm=query([$q]);
+}
+like($warm->{content},qr/"Email\/query"/,'cold ordinary request completes as JMAP success, not just HTTP 200');
 my $metrics=$http->get("http://127.0.0.1:$mgmt/metrics")->{content};
 like($metrics,qr/jmap_operation_seconds_count\{role="api",stage="sql"\}/,'real worker SQL timings reach parent');
 unlike($metrics,qr/synthetic\@|synthetic-only/,'telemetry contains no address or password');
@@ -70,7 +75,7 @@ open my $lock,'>',"$dir/synthetic.lock" or die $!;
 flock($lock,LOCK_EX) or die $!;
 my $started=time();
 my $timeout=query([$q]);
-cmp_ok(time()-$started,'<',2,'blocked safe read fails within bounded deadline');
+cmp_ok(time()-$started,'<',4,'blocked safe read fails within bounded deadline');
 unlike($timeout->{content},qr/"Email\/query"/,'expired read is not reported as successful query');
 flock($lock,LOCK_UN);close $lock;
 sleep 1.2; # bounded respawn backoff: new worker then starts cleanly

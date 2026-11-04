@@ -31,6 +31,8 @@ SQL pagination, a full raw mirror and local search are later stages.
   behind a mutation cannot terminate the mutation. Expired reads behind writes
   keep bounded tombstones until the worker replies; there is no write replay.
   Unknown methods are conservative. IDLE keeps its separate heartbeat watchdog.
+  Retiring IMAP transports close locally instead of attempting a potentially
+  blocking network LOGOUT from a destructor.
 - SMTP intent and the exact held MIME are persisted before entering the
   transport. Acknowledged relay is `confirmed` in the internal journal; it is not
   proof of final recipient delivery. A dropped reply, missing/corrupt payload,

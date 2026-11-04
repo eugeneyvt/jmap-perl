@@ -23,6 +23,9 @@ if (!$pid) {
   $ENV{JMAP_MGMT_PORT}=$mgmt;$ENV{JMAP_HOST}='127.0.0.1';$ENV{JMAP_MGMT_HOST}='127.0.0.1';
   $ENV{BASEURL}="http://127.0.0.1:$port";$ENV{JMAP_SECRET_KEY}='c' x 64;
   $ENV{JMAP_READ_DEADLINE}=2;$ENV{JMAP_IDLE_ENABLE}=0;$ENV{JMAP_SYNC_INTERVAL}=600;
+  # Exactly one accounts worker and one API worker. A retired process must
+  # release its admission slot before the replacement can be spawned.
+  $ENV{JMAP_MAX_WORKERS}=2;
   open STDOUT,'>',"$dir/proxy.log" or die $!;open STDERR,'>&',\*STDOUT or die $!;
   exec $^X,'-I.','bin/jmap-proxy.pl';die $!;
 }

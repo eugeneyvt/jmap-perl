@@ -92,19 +92,9 @@ sub observe_cgroup_memory {
   }
 }
 observe_cgroup_memory();
-my (%worker_names, %registered_accounts);
+my (%worker_names, %worker_watchers, %registered_accounts);
 my $accounts_discovered = 0;
 my $command_sequence = 0;
-
-# Reap zombie children; keep totals after a process disappears.
-my $child_watcher = AnyEvent->signal(signal => 'CHLD', cb => sub {
-  while ((my $pid = waitpid(-1, WNOHANG)) > 0) {
-    my $status = $?;
-    my $name = delete $worker_names{$pid};
-    $runtime_health->exited($name, $status) if defined $name;
-    warn "Reaped child $pid\n";
-  }
-});
 
 #
 # Backend connection management
@@ -117,6 +107,27 @@ my %idle_watch;
 my %realtime_sync;
 my $IDLE_ENABLED = $ENV{JMAP_IDLE_ENABLE} // 0;
 my $IDLE_FALLBACK = $ENV{JMAP_IDLE_FALLBACK_SECONDS} || 30;
+
+# AnyEvent owns SIGCHLD/waitpid. A competing signal watcher can observe the
+# signal after AnyEvent has already reaped the child, leaking its admission
+# slot forever. Watch each PID through the same event-loop child API instead.
+sub watch_worker {
+  my ($pid, $name) = @_;
+  $worker_names{$pid} = $name;
+  $worker_watchers{$pid} = AnyEvent->child(pid => $pid, cb => sub {
+    my (undef, $status) = @_;
+    delete $worker_watchers{$pid};
+    delete $worker_names{$pid};
+    $runtime_health->exited($name, $status);
+    if ($backend{$name} && $backend{$name}[2] == $pid) {
+      delete $backend{$name};
+      $runtime_policy->failed($name);
+      _idle_disconnected($name);
+      _fail_pending($name, 'backend process exited');
+    }
+    warn "Reaped child $pid\n";
+  });
+}
 
 # Take one pending entry, without autovivifying %waiting{$name} for a response
 # we were not expecting.
@@ -284,6 +295,7 @@ sub get_backend {
       %backend = ();
       %waiting = ();
       %worker_names = ();
+      %worker_watchers = ();
       # The child uses blocking IO, not the parent's event loop. Inherited
       # signal watchers must not make a read-deadline termination ineffective.
       $SIG{TERM} = 'DEFAULT';
@@ -326,7 +338,7 @@ sub get_backend {
         _fail_pending($accountid, 'backend closed connection');
       },
     ), 0, $pid, time()];
-    $worker_names{$pid} = $accountid;
+    watch_worker($pid, $accountid);
 
     $backend{$accountid}[0]->push_read(json => mk_json($accountid));
   }

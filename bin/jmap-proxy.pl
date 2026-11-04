@@ -1103,6 +1103,13 @@ sub run_backend_worker {
       if ($db && $db->isa('JMAP::ImapDB')) {
         require JMAP::Delivery;
         $sample->{delivery} = JMAP::Delivery->summary($db);
+        if (my $replica=$db->local_replica) {
+          $db->begin_read;
+          my $catalog=JMAP::Replica->catalog_token($db);
+          $db->commit;
+          my $coverage=$replica->coverage($catalog);
+          $sample->{replica}={map {$_=>$coverage->{$_}} qw(mode ready pending generation inventory_complete)};
+        }
       }
       $sample->{sampled_at} = time();
       $last_space_sample = time();

@@ -36,7 +36,8 @@ sub _schema {
   eval {
     $d->do("CREATE TABLE IF NOT EXISTS replica_state(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
       generation INTEGER NOT NULL DEFAULT 0, mode TEXT NOT NULL DEFAULT 'provider',
-      catalog_state TEXT, inventory_complete INTEGER NOT NULL DEFAULT 0, updated INTEGER NOT NULL DEFAULT 0)");
+      catalog_state TEXT, inventory_complete INTEGER NOT NULL DEFAULT 0, updated INTEGER NOT NULL DEFAULT 0,
+      parser_version INTEGER NOT NULL DEFAULT 1)");
     $d->do('INSERT OR IGNORE INTO replica_state(singleton) VALUES(1)');
     $d->do("CREATE TABLE IF NOT EXISTS replica_jobs(identity TEXT PRIMARY KEY,msgid TEXT NOT NULL,
       folder INTEGER NOT NULL,uidvalidity INTEGER NOT NULL,uid INTEGER NOT NULL,bytes INTEGER NOT NULL,
@@ -51,6 +52,15 @@ sub _schema {
       parser_version INTEGER NOT NULL,preview TEXT NOT NULL,text_bytes INTEGER NOT NULL,payload TEXT,updated INTEGER NOT NULL)');
     $d->do("CREATE VIRTUAL TABLE IF NOT EXISTS replica_fts USING fts5(msgid UNINDEXED,subject,sender,recipients,
       cc,bcc,body,attachments,tokenize='unicode61 remove_diacritics 2')");
+    my %state_columns=map {$_->[1]=>1} @{$d->selectall_arrayref('PRAGMA table_info(replica_state)')};
+    $d->do('ALTER TABLE replica_state ADD COLUMN parser_version INTEGER NOT NULL DEFAULT 0') unless $state_columns{parser_version};
+    my ($parser)=$d->selectrow_array('SELECT parser_version FROM replica_state WHERE singleton=1');
+    die "Replica parser newer than this worker\n" if $parser>$PARSER_VERSION;
+    if ($parser!=$PARSER_VERSION) {
+      $d->do("UPDATE replica_jobs SET state='pending',next_retry=0 WHERE state='complete' AND NOT EXISTS(
+        SELECT 1 FROM replica_documents d WHERE d.msgid=replica_jobs.msgid AND d.parser_version=? AND d.payload IS NOT NULL)",{},$PARSER_VERSION);
+      $d->do('UPDATE replica_state SET parser_version=?,generation=generation+1 WHERE singleton=1',{},$PARSER_VERSION);
+    }
     $d->do('PRAGMA user_version=1');
     $d->commit;1;
   } or do {my $e=$@;eval {$d->rollback};die $e};
@@ -62,7 +72,8 @@ sub coverage {
   my ($self,$catalog)=@_;
   my $state=$self->state;
   my ($pending)=$self->{dbh}->selectrow_array("SELECT count(*) FROM replica_jobs WHERE state NOT IN ('complete','obsolete')");
-  return {%$state,pending=>$pending,ready=>($state->{inventory_complete} && !$pending && ($state->{catalog_state}//'') eq $catalog) ? 1 : 0};
+  return {%$state,pending=>$pending,ready=>($state->{inventory_complete} && !$pending &&
+    ($state->{parser_version}//0)==$PARSER_VERSION && ($state->{catalog_state}//'') eq $catalog) ? 1 : 0};
 }
 
 sub catalog_token {
@@ -184,6 +195,9 @@ sub complete {
     # A legacy short-envelope ID collision cannot silently merge two originals.
     my ($old,$rowid)=$d->selectrow_array('SELECT sha256,rowid FROM replica_documents WHERE msgid=?',{},$job->{msgid});
     die "Replica message identity collision\n" if defined($old) && $old ne $job->{sha256};
+    die "Complete parsed document required\n" unless ref($doc->{parsed}) eq 'HASH' &&
+      ($doc->{parsed}{id}//'') eq $job->{msgid} && ref($doc->{parsed}{bodyStructure}) eq 'HASH' &&
+      ref($doc->{parsed}{bodyValues}) eq 'HASH' && ref($doc->{parsed}{attachments}) eq 'ARRAY';
     my @fields=map {$doc->{$_}//''} qw(subject sender recipients cc bcc body attachments);
     $d->do('DELETE FROM replica_fts WHERE rowid=?',{},$rowid) if defined $rowid;
     $d->do('INSERT OR REPLACE INTO replica_documents(msgid,sha256,parser_version,preview,text_bytes,payload,updated) VALUES(?,?,?,?,?,?,?)',

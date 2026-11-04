@@ -19,7 +19,8 @@ eval {$r->complete($job,{body=>'hello'})};like($@,qr/lease lost/,'expired owner 
 my $retry=$r->claim;
 is($retry->{sha256},'a'x64,'raw manifest survives worker loss');
 is($retry->{attempts},2,'expired lease is replayed');
-$r->complete($retry,{body=>'hello',subject=>'a'});
+eval {$r->complete($retry,{body=>'hello'})};like($@,qr/Complete parsed document required/,'a searchable fragment cannot be marked as a complete mail copy');
+$r->complete($retry,{body=>'hello',subject=>'a',parsed=>{id=>'old-stable-id',bodyStructure=>{type=>'text/plain'},bodyValues=>{},attachments=>[]}});
 is($r->state->{generation},1,'document and generation commit together');
 ok(!$r->claim,'completed work is never redownloaded');
 $r->seal_catalog('catalog',1);
@@ -34,4 +35,11 @@ eval {$r->complete($collision,{body=>'different'})};like($@,qr/identity collisio
 is($r->state->{generation},2,'failed index transaction does not advance generation');
 $r->fail($collision,'identity_collision');
 ok(!$r->claim,'failed job backs off durably');
+{
+  local $JMAP::Replica::PARSER_VERSION=2;
+  ok(!$r->coverage('catalog')->{ready},'a newer parser cannot silently certify an older index');
+  my $new=JMAP::Replica->new(path=>"$dir/replica.sqlite3");
+  is($new->{dbh}->selectrow_array('SELECT state FROM replica_jobs WHERE identity=?',{},$identity),'pending','parser upgrade requeues the original rather than reusing stale index data');
+  is($new->{dbh}->selectrow_array('SELECT sha256 FROM replica_jobs WHERE identity=?',{},$identity),'a'x64,'parser upgrade retains verified raw for local replay');
+}
 done_testing;

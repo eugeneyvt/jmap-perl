@@ -26,7 +26,8 @@ for my $n (1..4) {
   $r->enqueue({msgid=>"m$n",folder=>1,uidvalidity=>1,uid=>$n,bytes=>1});
   my $job=$r->claim;$r->raw_saved($job,{sha256=>'a'x64,bytes=>1});
   $r->complete($job,{subject=>$n==2?'Счёт за заказ':'Доставка',sender=>'sender@example.invalid',
-    body=>$n==2 || $n==4 ? 'Оплата заказа номер 123' : 'Другая тема',attachments=>'invoice.pdf'});
+    body=>$n==2 || $n==4 ? 'Оплата заказа номер 123' : 'Другая тема',attachments=>'invoice.pdf',
+    parsed=>{id=>"m$n",bodyStructure=>{type=>'text/plain'},bodyValues=>{},attachments=>[]}});
 }
 $db->begin_read;my $token=JMAP::Replica->catalog_token($db);$db->commit;
 $r->seal_catalog($token,1);$r->set_mode('local',$token);

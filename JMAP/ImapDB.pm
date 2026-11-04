@@ -3336,7 +3336,8 @@ sub local_search_generation {
   my ($Self)=@_;
   my $replica=$Self->local_replica or return 'provider';
   my $state=$replica->state;
-  return join(':',@$state{qw(mode generation inventory_complete)},$state->{catalog_state}//'');
+  return join(':',@$state{qw(mode generation inventory_complete)},$state->{catalog_state}//'',
+    $state->{parser_version}//0,$JMAP::Replica::PARSER_VERSION);
 }
 
 sub _imap_search_into {

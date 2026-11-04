@@ -31,6 +31,10 @@ releases work after lease expiry. Saved raw hashes survive parsing retries;
 document, FTS rows and index generation commit together. Missing sources become
 tombstones; originals/documents are retained. The worker copies metadata in
 bounded batches and rotates inventory across all selectable folders.
+Completeness requires a parsed JMAP document, not only an indexed fragment.
+Parser upgrades invalidate coverage and requeue verified raw for local replay;
+older workers refuse a newer parser generation. Readiness and private metrics
+expose mode, generation, inventory and pending counts without email addresses.
 
 `Mail::IMAPTalk::literal_handle_control` streams EXAMINE/BODY.PEEK originals to
 SSD without changing read flags or passing MIME through JSON. MIME-tools writes

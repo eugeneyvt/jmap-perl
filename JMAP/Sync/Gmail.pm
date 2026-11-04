@@ -72,8 +72,12 @@ sub _smtp_transport {
   });
 }
 
-sub imap_labels {
+sub imap_labels {shift->_write_labels('x-gm-labels',@_)}
+sub imap_add_labels {shift->_write_labels('+x-gm-labels',@_)}
+
+sub _write_labels {
   my $Self = shift;
+  my $operation=shift;
   my $imapname = shift;
   my $olduidvalidity = shift || 0;
   my $uids = shift;
@@ -93,10 +97,17 @@ sub imap_labels {
   );
 
   if ($olduidvalidity != $uidvalidity) {
-    return \%res;
+    die "UIDVALIDITY changed before Gmail label write\n";
   }
 
-  $imap->store($uids, "x-gm-labels", "(@$labels)");
+  die "Invalid Gmail label list\n" unless ref($labels) eq 'ARRAY';
+  # Pass native lists so IMAPTalk quotes spaces, quotes and backslashes; never
+  # interpolate user folder names into an IMAP command string.
+  $imap->store($uids,$operation,$labels) or die "Gmail label write not confirmed; do not retry automatically\n";
+  my $readback=$imap->fetch($uids,'(uid flags x-gm-labels)');
+  die "Gmail label readback unavailable\n" unless ref($readback) eq 'HASH' && keys(%$readback);
+  die "Gmail label target disappeared\n" if $uids=~/^\d+$/ && !exists($readback->{$uids});
+  die "Invalid Gmail label readback\n" if grep {ref($_->{'x-gm-labels'}) ne 'ARRAY'} values %$readback;
   $Self->_unselect($imap);
 
   $res{updated} = $uids;

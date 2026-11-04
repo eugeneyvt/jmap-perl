@@ -88,15 +88,15 @@ is(scalar(@{$db->{calls}})-$race_start,2,'provider candidates are retried when t
 my $legacy=$db->imap_search('text','tail');
 is_deeply([sort keys %$legacy],[qw(m1997 m1998 m1999 m2000)],'compatibility search adapter also uses batch UID mapping');
 
-# Gmail retains its current x-gm-raw language and folder scope exactly.
-my $gmail=SearchTransportDB->new('gmail-fixture');$gmail->{is_gmail}=1;
-$gmail->setuser({username=>'synthetic',password=>'synthetic',imapHost=>'example.invalid'});
+# Gmail retains x-gm-raw and includes Spam in its observable canonical scope.
+my $gmail=SearchTransportDB->new('gmail-fixture');
+$gmail->setuser({username=>'synthetic',password=>'synthetic',imapHost=>'imap.gmail.com'});
 $gmail->begin;
 for my $f ([1,'All Mail','\\AllMail'],[2,'Trash','\\Trash'],[3,'Spam','\\Junk']) {
   $gmail->dinsert('ifolders',{ifolderid=>$f->[0],imapname=>$f->[1],label=>$f->[2],sep=>'/',uidvalidity=>1,uidfirst=>1,uidnext=>2});
 }
 $gmail->commit;
 $gmail->prepare_provider_query([['text','has:attachment newer_than:1d']]);
-is_deeply([map {$_->[0]} @{$gmail->{calls}}],['All Mail','Trash'],'existing Gmail All Mail/Trash scope is preserved');
+is_deeply([map {$_->[0]} @{$gmail->{calls}}],['All Mail','Trash','Spam'],'Gmail scope includes All Mail, Trash and Spam');
 is_deeply([@{$gmail->{calls}[0]}[-2,-1]],['x-gm-raw','has:attachment newer_than:1d'],'Gmail syntax reaches provider unchanged');
 done_testing;

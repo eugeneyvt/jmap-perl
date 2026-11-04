@@ -64,6 +64,24 @@ my %ROLE_MAP = (
   '\\drafts' => 'drafts',
 );
 
+sub new {
+  my ($class,@args)=@_;
+  my $Self=$class->SUPER::new(@args);
+  $Self->begin_read;
+  my $server=$Self->dgetone('iserver');
+  $Self->commit;
+  $Self->_provider_mode($server ? $server->{imapHost} : undef);
+  return $Self;
+}
+
+sub _provider_mode {
+  my ($Self,$host)=@_;
+  # App-password accounts remain ordinary IMAP for authentication/token APIs,
+  # but Gmail's message/label identity is independent of the OAuth account type.
+  $Self->{is_gmail}=($Self->isa('JMAP::GmailDB') || lc($host//'') eq 'imap.gmail.com') ? 1 : 0;
+  delete $Self->{gmail_label_aliases};
+}
+
 sub setuser {
   my $Self = shift;
   my $args = shift;
@@ -106,6 +124,7 @@ sub setuser {
   }
 
   $Self->commit();
+  $Self->_provider_mode($args->{imapHost}) if exists $args->{imapHost};
 }
 
 sub access_token {
@@ -270,6 +289,7 @@ sub sync_folders {
   }
 
   $Self->sync_jmailboxes();
+  delete $Self->{gmail_label_aliases};
 }
 
 # synchronise from the imap folder cache to the jmap mailbox listing
@@ -390,6 +410,23 @@ sub sync_jmailboxes {
     }
     $seen{$id//''} = 1;
     $Self->dmaybeupdate('ifolders', {jmailboxid => $id}, {ifolderid => $folder->{ifolderid}});
+  }
+
+  if ($Self->{is_gmail} && grep {lc($_->{label}//'') eq '\\allmail'} @$ifolders) {
+    my $archive=$roletoid{archive};
+    unless ($archive) {
+      $archive=new_uuid_string();
+      $Self->dmake('jmailboxes',{jmailboxid=>$archive,name=>'Archive',role=>'archive',parentId=>undef,
+        sortOrder=>2,isSubscribed=>1,mayReadItems=>1,mayAddItems=>1,mayRemoveItems=>1,
+        maySetSeen=>1,maySetKeywords=>1,mayCreateChild=>0,mayRename=>0,mayDelete=>0,
+        maySubmit=>1,mayAdmin=>0},'jnoncountsmodseq');
+      # Repair previously unmapped unlabeled All Mail entries through normal
+      # JMAP reconciliation; never create a provider folder for this virtual role.
+      $Self->dbh->do("INSERT OR IGNORE INTO imsgidtodo(msgid) SELECT i.msgid FROM imessages i
+        JOIN ifolders f USING(ifolderid) WHERE lower(f.label)='\\allmail' AND i.labels='[]'");
+    }
+    $Self->dmaybedirty('jmailboxes',{active=>1},{jmailboxid=>$archive},'jnoncountsmodseq');
+    $seen{$archive}=1;
   }
 
   foreach my $mailbox (@$jmailboxes) {
@@ -3012,13 +3049,26 @@ sub labels {
   return { map { $_->{label} => [$_->{ifolderid}, $_->{jmailboxid}, $_->{imapname}] } @$data };
 }
 
+sub gmail_source_folders {
+  my ($Self,$folders)=@_;
+  return $folders unless $Self->{is_gmail};
+  my $owned=$Self->in_transaction ? 0 : 1;
+  $Self->begin_read if $owned;
+  my ($allmail)=$Self->dbh->selectrow_array("SELECT 1 FROM ifolders WHERE lower(label)='\\allmail' LIMIT 1");
+  $Self->commit if $owned;
+  # If All Mail is hidden/disabled in IMAP, the visible selectable folders are
+  # the remaining observable universe. Do not silently restrict it to Trash.
+  return $folders unless $allmail;
+  return [grep {lc($_->{label}//'')=~/^\\(?:allmail|trash|spam|junk)$/} @$folders];
+}
+
 sub sync_imap {
   my $Self = shift;
 
   $Self->begin();
   my $data = $Self->dget('ifolders');
   if ($Self->{is_gmail}) {
-    $data = [ grep { lc $_->{label} eq '\\allmail' or lc $_->{label} eq '\\trash' } @$data ];
+    $data = $Self->gmail_source_folders($data);
   }
   $Self->commit();
 
@@ -3044,7 +3094,7 @@ sub backfill {
   $Self->commit();
 
   if ($Self->{is_gmail}) {
-    $data = [ grep { lc $_->{label} eq '\\allmail' or lc $_->{label} eq '\\trash' } @$data ];
+    $data = $Self->gmail_source_folders($data);
   }
 
   return unless @$data;
@@ -3115,7 +3165,28 @@ sub calclabels {
 
   # Gmail returns the complete label set on every label view. A folder-local
   # override would turn an authoritative removal into stale unioned labels.
-  return @{$data->{'x-gm-labels'}} if $Self->{is_gmail} && ref($data->{'x-gm-labels'}) eq 'ARRAY';
+  if ($Self->{is_gmail} && ref($data->{'x-gm-labels'}) eq 'ARRAY') {
+    unless ($Self->{gmail_label_aliases}) {
+      my $owned=$Self->in_transaction ? 0 : 1;
+      $Self->begin_read if $owned;
+      $Self->{gmail_label_aliases}={map {lc($_->{label})=>$_->{label}} @{$Self->dget('ifolders')}};
+      $Self->commit if $owned;
+    }
+    my $map=$Self->{gmail_label_aliases};my @labels;
+    for my $label (@{$data->{'x-gm-labels'}}) {
+      next if lc($label)=~/^\\all(?:mail)?$/;
+      if ($label=~/^\\/) {
+        my @names=(lc($label));
+        push @names,'\\drafts','\\draft' if lc($label)=~/^\\drafts?$/;
+        push @names,'\\spam','\\junk' if lc($label)=~/^\\(?:spam|junk)$/;
+        push @names,'\\flagged' if lc($label) eq '\\starred';
+        my ($known)=grep {exists $map->{$_}} @names;
+        $label=$map->{$known} if defined $known;
+      }
+      push @labels,$label;
+    }
+    return @labels;
+  }
 
   return ($forcelabel) if $forcelabel;
   return (@{$data->{'x-gm-labels'}}) if $data->{'x-gm-labels'};
@@ -3369,7 +3440,7 @@ sub _imap_search_into {
   $Self->begin();
   my $data = $Self->dget('ifolders');
   if ($Self->{is_gmail}) {
-    $data = [ grep { lc $_->{label} eq '\\allmail' or lc $_->{label} eq '\\trash' } @$data ];
+    $data = $Self->gmail_source_folders($data);
   }
   $Self->commit();
 
@@ -3428,13 +3499,20 @@ sub import_message {
 
   $Self->begin();
   my $folderdata = $Self->dget('ifolders');
+  my $archive=$Self->{is_gmail} ? $Self->dgetfield('jmailboxes',{role=>'archive',active=>1},'jmailboxid') : undef;
   $Self->commit();
 
   my %foldermap = map { $_->{ifolderid} => $_ } @$folderdata;
   my %jmailmap = map { $_->{jmailboxid} => $_ } grep { $_->{jmailboxid} } @$folderdata;
+  if ($Self->{is_gmail} && defined($archive) && !$jmailmap{$archive}) {
+    my ($allmail)=grep {lc($_->{label}//'') eq '\\allmail'} @$folderdata;
+    $jmailmap{$archive}=$allmail if $allmail;
+  }
 
   # store to the first named folder - we can use labels on gmail to add to other folders later.
   my ($id, @others) = @$mailboxIds;
+  die "Unknown import mailbox\n" unless defined($id) && $jmailmap{$id};
+  die "Unknown import mailbox\n" if grep {!defined($_) || !$jmailmap{$_}} @$mailboxIds;
   my $imapname = $jmailmap{$id}{imapname};
   my $uidvalidity = $jmailmap{$id}{uidvalidity};
 
@@ -3449,15 +3527,28 @@ sub import_message {
   my $date = Date::Format::time2str('%e-%b-%Y %T %z', $internaldate);
 
   my $appendres = $Self->backend_cmd('imap_append', $imapname, "(@flags)", $date, $rfc822);
-  # XXX - compare $appendres->[2] with uidvalidity
+  die "APPEND result requires reconciliation; do not retry automatically\n" unless ref($appendres) eq 'ARRAY' &&
+    defined($appendres->[3]) && $appendres->[3]=~/^\d+$/ && $appendres->[3]>0 &&
+    defined($appendres->[2]) && $appendres->[2]==$uidvalidity;
   my $uid = $appendres->[3];
 
   # make sure we're up to date: XXX - imap only
   my $ifolderid;
   if ($Self->{is_gmail}) {
-    my ($am) = grep { lc $_->{label} eq '\\allmail' } @$folderdata;
-    $Self->do_folder($am->{ifolderid}, undef);
-    $ifolderid = $am->{ifolderid};
+    if (@others) {
+      my @labels;
+      for my $mailbox (@others) {
+        die "Unknown import mailbox\n" unless $jmailmap{$mailbox};
+        my $label=$jmailmap{$mailbox}{label};
+        push @labels,$label if defined($label) && lc($label) ne '\\allmail';
+      }
+      $Self->backend_cmd('imap_add_labels',$imapname,$uidvalidity,$uid,\@labels) if @labels;
+    }
+    # APPENDUID is relative to the APPEND destination, not All Mail. Gmail's
+    # Drafts/Sent/All Mail copies can have completely different IMAP UIDs.
+    my $destination=$jmailmap{$id};
+    $Self->do_folder($destination->{ifolderid},undef);
+    $ifolderid=$destination->{ifolderid};
   }
   else {
     # copy to all the other folders too and sync them
@@ -3791,7 +3882,7 @@ sub sync_jmap_msgid {
   my @jmailboxids = grep { $_ } map { $labels->{$_}[1] } @list;
 
   # check for archive folder for gmail
-  if ($Self->{is_gmail} and @$imessages and not @list) {
+  if ($Self->{is_gmail} and @$imessages and not @jmailboxids) {
     @jmailboxids = ($Self->dgetfield('jmailboxes', { role => 'archive' }, 'jmailboxid'));
   }
 

@@ -7,7 +7,6 @@ use Fcntl qw(:flock);
 use JSON::XS qw(encode_json);
 use Digest::SHA qw(sha256_hex);
 use JMAP::ImapDB;
-use JMAP::GmailDB;
 use JMAP::Replica;
 use JMAP::RawStore;
 use JMAP::ReplicaWorker;
@@ -38,8 +37,6 @@ $SIG{ALRM}=sub {die "Replica run deadline exceeded\n"};alarm($max_seconds);
 my $store=JMAP::StorageBox->from_config(root=>$raw_root,mount=>$mount,marker=>$marker,marker_sha=>$marker_sha,account=>$account);
 $store->_root;
 my $db=JMAP::ImapDB->new($account);
-my $access=$db->access_data;
-if (($access->{imapHost}//'') eq 'imap.gmail.com') {$db=JMAP::GmailDB->new($account)}
 my $replica=JMAP::Replica->new(path=>"$base/replica.sqlite3");
 my $spool="$base/replica-spool";JMAP::AtomicFile->ensure_directory($spool);
 

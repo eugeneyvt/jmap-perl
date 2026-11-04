@@ -23,4 +23,9 @@ is_deeply(decode_json($message->{keywords}),{},'older Seen flag is not resurrect
 my $members=$db->dbh->selectcol_arrayref("SELECT jmailboxid FROM jmessagemap WHERE msgid='provider-id' AND active=1 ORDER BY jmailboxid");
 is_deeply($members,['other'],'removed Inbox label is not resurrected from a stale label view');
 $db->commit;
+$db->begin;
+$db->dinsert('ifolders',{ifolderid=>3,imapname=>'Drafts',label=>'\\Drafts',jmailboxid=>'drafts',sep=>'/'});
+$db->commit;
+delete $db->{gmail_label_aliases};
+is_deeply([$db->calclabels(undef,{'x-gm-labels'=>['\\Draft']})],['\\Drafts'],'Gmail Draft message label maps to the Drafts source identity');
 done_testing;

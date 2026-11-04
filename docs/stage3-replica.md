@@ -49,6 +49,15 @@ work. JMAP body/part IDs are checked against the independent Data::JSEmail path.
 
 ## Search modes
 
+Gmail protocol detection also covers ordinary IMAP app-password accounts; it
+does not change their token/authentication API into OAuth. Canonical realtime
+and provider-search sources include All Mail, Trash and Spam/Junk; a disabled
+All Mail view falls back to visible folders. Replica inventory still checks
+every selectable folder. Unlabeled mail retains a stable virtual Archive role,
+and message Draft/Spam label aliases are resolved to the discovered source IDs.
+APPENDUID is resolved in the actual append folder (Drafts/Sent can differ from
+All Mail), and label names use the IMAP library's native quoted list encoding.
+
 Default is `provider`. `shadow` returns provider results and compares complete
 local hits, logging only account/query hashes and aggregate differences.
 `local` requires current inventory/catalog coverage and no unresolved jobs.

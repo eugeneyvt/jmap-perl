@@ -22,4 +22,14 @@ eval {JMAP::ReplicaParser->parse("$dir/test.eml",spool=>$dir,max_text_bytes=>3)}
 like($@,qr/text budget/,'oversize extracted text is explicit failure, not silently truncated');
 opendir my $d,$dir or die $!;my @temporary=grep {/^jmap-mime-/} readdir($d);closedir $d;
 is(scalar @temporary,0,'per-job MIME scratch is removed on both success and failure');
+open $f,'>:raw',"$dir/omitted.eml" or die $!;
+print {$f} "Subject: omitted charset\r\nContent-Type: text/plain\r\n\r\n",encode('UTF-8','Проверяем точный текст без charset'),"\r\n";close $f;
+my $omitted=JMAP::ReplicaParser->parse("$dir/omitted.eml",spool=>$dir,msgid=>'omitted');
+like($omitted->{body},qr/точный текст/,'missing charset accepts strictly valid UTF-8 in search text');
+like($omitted->{parsed}{bodyValues}{1}{value},qr/точный текст/,'reader receives the same decoded text');
+ok($omitted->{parsed}{bodyValues}{1}{isEncodingProblem},'inferred charset remains visible in JMAP');
+open $f,'>:raw',"$dir/invalid.eml" or die $!;
+print {$f} "Subject: unknown octets\r\nContent-Type: text/plain\r\n\r\ninvalid\xff\r\n";close $f;
+eval {JMAP::ReplicaParser->parse("$dir/invalid.eml",spool=>$dir,msgid=>'invalid')};
+ok($@,'missing charset never silently replaces unknown octets');
 done_testing;

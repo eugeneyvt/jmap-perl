@@ -20,6 +20,8 @@ sub process {
     my $mapping=$db->dgetone('imessages',{ifolderid=>$job->{folder},uid=>$job->{uid}});
     $db->commit;
     die "Replica source changed\n" unless $folder && $mapping && $folder->{uidvalidity}==$job->{uidvalidity} && $mapping->{msgid} eq $job->{msgid};
+    my $alias=$db->{is_gmail} && $self->{replica}->complete_alias($job);
+    unless ($alias) {
     my $stored_hash=$job->{sha256};
     if (!$stored_hash && $db->{is_gmail}) {
       # X-GM-MSGID is provider-assigned across label copies. Generic legacy
@@ -56,6 +58,7 @@ sub process {
     # The complete SSD document remains the source for Email/get even if a
     # concurrent account writer prevents the optional list-summary update.
     eval {$db->rollback} if !$summary_ok && $db->in_transaction;
+    }
     1;
   };
   my $error=$@;

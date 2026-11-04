@@ -213,6 +213,30 @@ sub complete {
   } or do {my $e=$@;eval {$d->rollback};die $e};
 }
 
+sub complete_alias {
+  my ($self,$job)=@_;my $d=$self->{dbh};
+  # Caller must establish provider-assigned Gmail identity. A verified current
+  # document and a completed source are sufficient for another label alias;
+  # it introduces no new bytes or index content, so needs no Box I/O or parse.
+  $d->do('BEGIN IMMEDIATE');
+  my $matched;
+  eval {
+    $self->_owned($job);
+    my ($sha)=$d->selectrow_array("SELECT d.sha256 FROM replica_documents d
+      JOIN replica_jobs q ON q.msgid=d.msgid AND q.sha256=d.sha256
+      WHERE d.msgid=? AND d.parser_version=? AND d.payload IS NOT NULL
+      AND q.state='complete' AND q.bytes=? LIMIT 1",{},$job->{msgid},$PARSER_VERSION,$job->{bytes});
+    if ($sha) {
+      die "Replica message identity collision\n" if $job->{sha256} && $job->{sha256} ne $sha;
+      $d->do("UPDATE replica_jobs SET state='complete',sha256=?,lease_token=NULL,lease_until=0,error_code=NULL,updated=? WHERE identity=?",
+        {},$sha,time(),$job->{identity});
+      $matched=1;
+    }
+    $d->commit;1;
+  } or do {my $e=$@;eval {$d->rollback};die $e};
+  return $matched;
+}
+
 sub parsed_message {
   my ($self,$id)=@_;
   my ($payload)=$self->{dbh}->selectrow_array('SELECT payload FROM replica_documents WHERE msgid=? AND parser_version=?',{},$id,$PARSER_VERSION);

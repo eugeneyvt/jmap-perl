@@ -55,10 +55,10 @@ sub parse {
       $text.=$buf;
     }
     $f->close;
-    my $charset=$part->head->mime_attr('content-type.charset')//'UTF-8';
+    my $charset=$part->head->mime_attr('content-type.charset');
     # Corrupt/unknown charset is a visible parse failure; do not mark lossy or
     # truncated search text as a complete document.
-    $text=decode($charset,$text,FB_CROAK);
+    ($text)=_decode_text($text,$charset);
     if ($html) {
       $text =~ s{<(script|style)\b[^>]*>.*?</\1\s*>}{ }gis;
       $text=HTML::Strip->new->parse($text);
@@ -110,14 +110,27 @@ sub _node {
   if ($type=~m{^text/}i && $handle) {
     $$used+=$size;die "MIME text budget exceeded\n" if $$used>$budget;
     my $text=$handle->as_string;
-    $text=decode($charset//'us-ascii',$text,FB_CROAK);$text=~s/\r\n/\n/g;
-    $values->{$number}={value=>$text,isEncodingProblem=>$JSON::false,isTruncated=>$JSON::false};
+    my $inferred;
+    ($text,$inferred)=_decode_text($text,$charset);$text=~s/\r\n/\n/g;
+    $values->{$number}={value=>$text,isEncodingProblem=>$inferred?$JSON::true:$JSON::false,isTruncated=>$JSON::false};
   }
   return {partId=>$number,blobId=>"m-$id-$number",type=>$type,size=>0+$size,headers=>$headers,
     name=>$entity->head->recommended_filename,cid=>Data::JSEmail::asOneURL($entity->head->get('Content-ID')),
     charset=>$charset,language=>Data::JSEmail::asCommaList($entity->head->get('Content-Language')),
     location=>Data::JSEmail::asText($entity->head->get('Content-Location')),
     disposition=>$entity->head->mime_attr('content-disposition')||undef};
+}
+
+sub _decode_text {
+  my ($octets,$charset)=@_;
+  # ASCII is MIME's default. Some real messages omit charset while carrying
+  # valid UTF-8; accept that exact, reversible decoding and flag the omission.
+  # Never guess a legacy encoding or replace undecodable bytes silently.
+  return (decode($charset,$octets,FB_CROAK),0) if defined($charset) && length($charset);
+  my $copy=$octets;
+  my $ascii=eval {decode('us-ascii',$copy,FB_CROAK)};
+  return ($ascii,0) if defined $ascii;
+  return (decode('UTF-8',$octets,FB_CROAK),1);
 }
 
 sub _header {

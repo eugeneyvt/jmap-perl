@@ -62,4 +62,17 @@ ok($r->parsed_message('stable'),'tombstone preserves original document evidence'
 $db->begin;$db->dinsert('imessages',{ifolderid=>1,uid=>1,msgid=>'stable',size=>length($db->{raw})});$db->commit;
 is($r->reconcile_catalog($db,1)->{queued},1,'reappearing unchanged source becomes runnable');
 is($r->{dbh}->selectrow_array("SELECT state FROM replica_jobs"),'pending','reappearance has explicit pending status');
+$box_available=1;
+ok($worker->process($r->claim)->{ok},'saved original supports reappearing UID without provider');
+$box_available=0;$db->{is_gmail}=1;
+$db->begin;
+$db->dinsert('ifolders',{ifolderid=>2,jmailboxid=>'label',sep=>'/',imapname=>'Label',label=>'Label',uidvalidity=>9,uidfirst=>1,uidnext=>2});
+$db->dinsert('imessages',{ifolderid=>2,uid=>1,msgid=>'stable',size=>length($db->{raw})});$db->commit;
+$r->reconcile_catalog($db);
+my $generation=$r->state->{generation};
+ok($worker->process($r->claim)->{ok},'Gmail label alias completes without provider or unavailable Box');
+is($r->state->{generation},$generation,'label alias does not rewrite identical index content');
+is($r->{dbh}->selectrow_array("SELECT count(*) FROM replica_jobs WHERE state='complete'"),2,'both UID manifests complete');
+opendir $d,"$dir/spool";my @scratch=grep {!/^\.{1,2}$/} readdir($d);closedir $d;
+is(scalar @scratch,0,'alias leaves no hidden staging files');
 done_testing;

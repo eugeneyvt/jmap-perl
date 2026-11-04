@@ -3,11 +3,16 @@ use strict;
 use warnings;
 use MIME::Parser;
 use File::Temp;
-use Encode qw(decode FB_CROAK);
+use Encode qw(decode FB_CROAK FB_DEFAULT);
+use Encode::Alias;
 use HTML::Strip;
 use Data::JSEmail;
-use Email::MIME;
+use Email::Simple;
 use JSON;
+
+# Logical-order ISO-8859-8 uses the same character map; Perl omits this MIME
+# label on some distributions. Preserve the declared charset in JMAP metadata.
+Encode::Alias::define_alias('iso-8859-8-i' => 'iso-8859-8');
 
 # MIME binary parts stay in private temporary files. Limit parts and extracted
 # text separately: a large binary attachment must not become a Perl string.
@@ -30,17 +35,17 @@ sub parse {
     $entity=$parser->parse_open($path) or die "MIME parse failed\n";
   }
   my $budget=$args{max_text_bytes}//16*1024*1024;
-  my %doc;
+  my %doc;my $encoding_problem=0;
   for my $field ([subject=>'Subject'],[sender=>'From'],[recipients=>'To'],[cc=>'Cc'],[bcc=>'Bcc']) {
     my $value=$entity->head->get($field->[1])//'';
-    $doc{$field->[0]}=_header($value);
+    $doc{$field->[0]}=_header($value,\$encoding_problem);
   }
   my (@body,@names);my @todo=($entity);my $used=0;
   while (my $part=shift @todo) {
     my @parts=$part->parts;
     if (@parts) {unshift @todo,@parts;next}
     my $name=$part->head->recommended_filename;
-    push @names,_header($name) if defined($name) && length($name);
+    push @names,_header($name,\$encoding_problem) if defined($name) && length($name);
     # Attached text files are attachments, not a mail body. Attachment content
     # indexing/OCR is deliberately outside the current search contract.
     next if ($part->head->mime_attr('content-disposition')//'') =~ /^attachment/i;
@@ -56,9 +61,10 @@ sub parse {
     }
     $f->close;
     my $charset=$part->head->mime_attr('content-type.charset');
-    # Corrupt/unknown charset is a visible parse failure; do not mark lossy or
-    # truncated search text as a complete document.
-    ($text)=_decode_text($text,$charset);
+    # RFC 8621 permits best-effort text with an explicit encoding-problem flag.
+    # Original MIME bytes are already retained independently and never rewritten.
+    my $problem;
+    ($text,$problem)=_decode_text($text,$charset);$encoding_problem||=$problem;
     if ($html) {
       $text =~ s{<(script|style)\b[^>]*>.*?</\1\s*>}{ }gis;
       $text=HTML::Strip->new->parse($text);
@@ -68,7 +74,9 @@ sub parse {
   $doc{body}=join("\n",@body);$doc{body}=~s/\s+/ /g;
   $doc{attachments}=join("\n",@names);
   if (defined $args{msgid}) {
-    my $head=Email::MIME->new($entity->head->as_string."\r\n");
+    # Header-only inspection must not reparse a multipart MIME tree or reject
+    # recoverable malformed Content-Type/address fields a second time.
+    my $head=Email::Simple->new($entity->head->as_string."\r\n");
     my $parsed={id=>$args{msgid},headers=>Data::JSEmail::headers($head)};
     for my $field ([sender=>'Sender'],[from=>'From'],[to=>'To'],[cc=>'Cc'],[bcc=>'Bcc'],[replyTo=>'Reply-To']) {
       $parsed->{$field->[0]}=Data::JSEmail::asAddresses($head->header($field->[1]));
@@ -88,13 +96,15 @@ sub parse {
     $parsed->{hasAttachment}=$has?$JSON::true:$JSON::false;
     $parsed->{preview}=substr($doc{body},0,256);$parsed->{size}=-s $path;
     $doc{parsed}=$parsed;
+    $encoding_problem ||= scalar grep {$_->{isEncodingProblem}} values %values;
   }
+  $doc{encoding_problem}=$encoding_problem?1:0;
   return \%doc;
 }
 
 sub _node {
   my ($entity,$number,$id,$values,$used,$budget)=@_;
-  my $headers=Data::JSEmail::headers(Email::MIME->new($entity->head->as_string."\r\n"));
+  my $headers=Data::JSEmail::headers(Email::Simple->new($entity->head->as_string."\r\n"));
   my @parts=$entity->parts;
   if (@parts) {
     my @nodes;
@@ -123,20 +133,26 @@ sub _node {
 
 sub _decode_text {
   my ($octets,$charset)=@_;
-  # ASCII is MIME's default. Some real messages omit charset while carrying
-  # valid UTF-8; accept that exact, reversible decoding and flag the omission.
-  # Never guess a legacy encoding or replace undecodable bytes silently.
-  return (decode($charset,$octets,FB_CROAK),0) if defined($charset) && length($charset);
+  my $declared=defined($charset) && length($charset);
+  my $encoding=$declared?$charset:'us-ascii';
   my $copy=$octets;
-  my $ascii=eval {decode('us-ascii',$copy,FB_CROAK)};
-  return ($ascii,0) if defined $ascii;
-  return (decode('UTF-8',$octets,FB_CROAK),1);
+  my $text=eval {decode($encoding,$copy,FB_CROAK)};
+  return ($text,0) if defined $text;
+  # Missing/unknown labels fall back to UTF-8 as in the existing JMAP parser;
+  # malformed octets become U+FFFD and are explicitly flagged, never hidden.
+  $encoding='UTF-8' unless $declared && Encode::find_encoding($charset);
+  return (decode($encoding,$octets,FB_DEFAULT),1);
 }
 
 sub _header {
-  my ($value)=@_;
-  my $decoded=eval {decode('MIME-Header',$value,FB_CROAK)};
-  die "MIME header decode failed\n" unless defined $decoded;
+  my ($value,$problem)=@_;
+  my $copy=$value;
+  my $decoded=eval {decode('MIME-Header',$copy,FB_CROAK)};
+  unless (defined $decoded) {
+    $$problem=1 if $problem;
+    $copy=$value;$decoded=eval {decode('MIME-Header',$copy,FB_DEFAULT)};
+    $decoded=decode('UTF-8',$value,FB_DEFAULT) unless defined $decoded;
+  }
   $decoded =~ s/\s+/ /g;
   return $decoded;
 }

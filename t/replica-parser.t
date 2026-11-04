@@ -30,6 +30,13 @@ like($omitted->{parsed}{bodyValues}{1}{value},qr/точный текст/,'reade
 ok($omitted->{parsed}{bodyValues}{1}{isEncodingProblem},'inferred charset remains visible in JMAP');
 open $f,'>:raw',"$dir/invalid.eml" or die $!;
 print {$f} "Subject: unknown octets\r\nContent-Type: text/plain\r\n\r\ninvalid\xff\r\n";close $f;
-eval {JMAP::ReplicaParser->parse("$dir/invalid.eml",spool=>$dir,msgid=>'invalid')};
-ok($@,'missing charset never silently replaces unknown octets');
+my $invalid=JMAP::ReplicaParser->parse("$dir/invalid.eml",spool=>$dir,msgid=>'invalid');
+ok($invalid->{parsed}{bodyValues}{1}{isEncodingProblem},'malformed octets remain explicitly flagged in native JMAP body values');
+like($invalid->{parsed}{bodyValues}{1}{value},qr/invalid\x{fffd}/,'unmappable bytes have visible replacement characters');
+ok($invalid->{encoding_problem},'index quality tracks affected documents');
+open $f,'>:raw',"$dir/hebrew.eml" or die $!;
+print {$f} "Subject: Hebrew\r\nContent-Type: text/plain; charset=ISO-8859-8-I\r\n\r\n",encode('ISO-8859-8','שלום'),"\r\n";close $f;
+my $hebrew=JMAP::ReplicaParser->parse("$dir/hebrew.eml",spool=>$dir,msgid=>'hebrew');
+like($hebrew->{parsed}{bodyValues}{1}{value},qr/שלום/,'logical Hebrew MIME label has its exact known character map');
+ok(!$hebrew->{encoding_problem},'known Hebrew label is not lossy');
 done_testing;

@@ -8,7 +8,7 @@ use JSON::XS;
 use JMAP::AtomicFile;
 
 my $json=JSON::XS->new->canonical->utf8;
-our $PARSER_VERSION=1;
+our $PARSER_VERSION=2;
 
 # Separate SSD database: a raw-storage timeout cannot hold the JMAP account
 # writer lock. Journal mode remains DELETE; do not enable WAL on old runtimes.
@@ -37,7 +37,7 @@ sub _schema {
     $d->do("CREATE TABLE IF NOT EXISTS replica_state(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
       generation INTEGER NOT NULL DEFAULT 0, mode TEXT NOT NULL DEFAULT 'provider',
       catalog_state TEXT, inventory_complete INTEGER NOT NULL DEFAULT 0, updated INTEGER NOT NULL DEFAULT 0,
-      parser_version INTEGER NOT NULL DEFAULT 1)");
+      parser_version INTEGER NOT NULL DEFAULT $PARSER_VERSION)");
     $d->do('INSERT OR IGNORE INTO replica_state(singleton) VALUES(1)');
     $d->do("CREATE TABLE IF NOT EXISTS replica_jobs(identity TEXT PRIMARY KEY,msgid TEXT NOT NULL,
       folder INTEGER NOT NULL,uidvalidity INTEGER NOT NULL,uid INTEGER NOT NULL,bytes INTEGER NOT NULL,
@@ -50,6 +50,9 @@ sub _schema {
       uidnext INTEGER NOT NULL,uidfirst INTEGER NOT NULL,checked INTEGER NOT NULL)');
     $d->do('CREATE TABLE IF NOT EXISTS replica_documents(msgid TEXT PRIMARY KEY,sha256 TEXT NOT NULL,
       parser_version INTEGER NOT NULL,preview TEXT NOT NULL,text_bytes INTEGER NOT NULL,payload TEXT,updated INTEGER NOT NULL)');
+    my %document_columns=map {$_->[1]=>1} @{$d->selectall_arrayref('PRAGMA table_info(replica_documents)')};
+    $d->do('ALTER TABLE replica_documents ADD COLUMN encoding_problem INTEGER NOT NULL DEFAULT 0') unless $document_columns{encoding_problem};
+    $d->do('CREATE INDEX IF NOT EXISTS replica_encoding_problem ON replica_documents(encoding_problem) WHERE encoding_problem=1');
     $d->do("CREATE VIRTUAL TABLE IF NOT EXISTS replica_fts USING fts5(msgid UNINDEXED,subject,sender,recipients,
       cc,bcc,body,attachments,tokenize='unicode61 remove_diacritics 2')");
     my %state_columns=map {$_->[1]=>1} @{$d->selectall_arrayref('PRAGMA table_info(replica_state)')};
@@ -72,7 +75,8 @@ sub coverage {
   my ($self,$catalog)=@_;
   my $state=$self->state;
   my ($pending)=$self->{dbh}->selectrow_array("SELECT count(*) FROM replica_jobs WHERE state NOT IN ('complete','obsolete')");
-  return {%$state,pending=>$pending,ready=>($state->{inventory_complete} && !$pending &&
+  my ($encoding)=$state->{parser_version}>=2 ? $self->{dbh}->selectrow_array('SELECT count(*) FROM replica_documents WHERE encoding_problem=1') : undef;
+  return {%$state,pending=>$pending,encoding_problem_documents=>$encoding,ready=>($state->{inventory_complete} && !$pending &&
     ($state->{parser_version}//0)==$PARSER_VERSION && ($state->{catalog_state}//'') eq $catalog) ? 1 : 0};
 }
 
@@ -200,9 +204,9 @@ sub complete {
       ref($doc->{parsed}{bodyValues}) eq 'HASH' && ref($doc->{parsed}{attachments}) eq 'ARRAY';
     my @fields=map {$doc->{$_}//''} qw(subject sender recipients cc bcc body attachments);
     $d->do('DELETE FROM replica_fts WHERE rowid=?',{},$rowid) if defined $rowid;
-    $d->do('INSERT OR REPLACE INTO replica_documents(msgid,sha256,parser_version,preview,text_bytes,payload,updated) VALUES(?,?,?,?,?,?,?)',
+    $d->do('INSERT OR REPLACE INTO replica_documents(msgid,sha256,parser_version,preview,text_bytes,payload,updated,encoding_problem) VALUES(?,?,?,?,?,?,?,?)',
       {},$job->{msgid},$job->{sha256},$PARSER_VERSION,substr($doc->{body}//'',0,256),length($json->encode(\@fields)),
-      $doc->{parsed} ? $json->encode($doc->{parsed}) : undef,time());
+      $doc->{parsed} ? $json->encode($doc->{parsed}) : undef,time(),$doc->{encoding_problem}?1:0);
     ($rowid)=$d->selectrow_array('SELECT rowid FROM replica_documents WHERE msgid=?',{},$job->{msgid});
     $d->do('INSERT INTO replica_fts(rowid,msgid,subject,sender,recipients,cc,bcc,body,attachments) VALUES(?,?,?,?,?,?,?,?,?)',
       {},$rowid,$job->{msgid},@fields);

@@ -41,7 +41,7 @@ sub ingest {
   if (ref($data->{replica}) eq 'HASH' && ($data->{replica}{mode}//'')=~/^(provider|shadow|local)$/) {
     my $aid=$name;$aid=~s/:(?:idle|sync|backfill|content)$//;
     my %sample=(mode=>$data->{replica}{mode},sampled_at=>$data->{sampled_at}//time());
-    for my $field (qw(ready pending generation inventory_complete)) {
+    for my $field (qw(ready pending generation inventory_complete encoding_problem_documents)) {
       my $value=$data->{replica}{$field};
       $sample{$field}=0+$value if defined($value) && !ref($value) && $value=~/^\d+$/;
     }
@@ -103,7 +103,7 @@ sub metrics {
   my @out;
   for my $aid (sort keys %{$self->{replica}||{}}) {
     my $key=substr(sha256_hex($aid),0,16);my $replica=$self->{replica}{$aid};
-    for my $field (qw(ready pending generation inventory_complete)) {
+    for my $field (qw(ready pending generation inventory_complete encoding_problem_documents)) {
       push @out,'jmap_replica_'.$field.'{account_key="'.$key.'"} '.$replica->{$field} if defined $replica->{$field};
     }
   }

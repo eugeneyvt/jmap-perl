@@ -44,8 +44,15 @@ deadline; no product timeout is lengthened to hide a cold bootstrap failure.
 `Mail::IMAPTalk::literal_handle_control` streams EXAMINE/BODY.PEEK originals to
 SSD without changing read flags or passing MIME through JSON. MIME-tools writes
 binary parts to private scratch; text extraction has a16MiB budget and1000-part
-limit. Budget/charset/parse errors retain verified raw and report unfinished
-work. JMAP body/part IDs are checked against the independent Data::JSEmail path.
+limit. Structural/budget errors retain verified raw and report unfinished
+work. Parser generation2 handles malformed charset octets with visible Unicode
+replacement and native RFC8621 isEncodingProblem=true, while retaining the exact
+original. Known logical Hebrew ISO-8859-8-I has its exact charset mapping.
+Encoding-affected documents have a separately indexed quality count in private
+status/metrics; text search cannot recover characters absent from a malformed
+source encoding. Header-only inspection uses Email::Simple to avoid reparsing
+MIME trees or rejecting recoverable header fields. JMAP body/part IDs are checked
+against the independent Data::JSEmail path.
 
 ## Search modes
 

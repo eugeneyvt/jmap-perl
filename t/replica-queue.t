@@ -20,12 +20,13 @@ my $retry=$r->claim;
 is($retry->{sha256},'a'x64,'raw manifest survives worker loss');
 is($retry->{attempts},2,'expired lease is replayed');
 eval {$r->complete($retry,{body=>'hello'})};like($@,qr/Complete parsed document required/,'a searchable fragment cannot be marked as a complete mail copy');
-$r->complete($retry,{body=>'hello',subject=>'a',parsed=>{id=>'old-stable-id',bodyStructure=>{type=>'text/plain'},bodyValues=>{},attachments=>[]}});
+$r->complete($retry,{body=>'hello',subject=>'a',encoding_problem=>1,parsed=>{id=>'old-stable-id',bodyStructure=>{type=>'text/plain'},bodyValues=>{},attachments=>[]}});
 is($r->state->{generation},1,'document and generation commit together');
 ok(!$r->claim,'completed work is never redownloaded');
 $r->seal_catalog('catalog',1);
 $r->set_mode('local','catalog');
 ok($r->coverage('catalog')->{ready},'verified full catalog can enter local mode');
+is($r->coverage('catalog')->{encoding_problem_documents},1,'recoverable encoding problems remain visible separately from acquisition coverage');
 ok(!$r->coverage('new-mail')->{ready},'new catalog invalidates completeness');
 eval {$r->set_mode('local','new-mail')};like($@,qr/coverage incomplete/,'switch refuses an incomplete catalog');
 $r->enqueue({folder=>2,uidvalidity=>5,uid=>8,bytes=>99,msgid=>'old-stable-id'});
@@ -36,7 +37,7 @@ is($r->state->{generation},2,'failed index transaction does not advance generati
 $r->fail($collision,'identity_collision');
 ok(!$r->claim,'failed job backs off durably');
 {
-  local $JMAP::Replica::PARSER_VERSION=2;
+  local $JMAP::Replica::PARSER_VERSION=$JMAP::Replica::PARSER_VERSION+1;
   ok(!$r->coverage('catalog')->{ready},'a newer parser cannot silently certify an older index');
   my $new=JMAP::Replica->new(path=>"$dir/replica.sqlite3");
   is($new->{dbh}->selectrow_array('SELECT state FROM replica_jobs WHERE identity=?',{},$identity),'pending','parser upgrade requeues the original rather than reusing stale index data');

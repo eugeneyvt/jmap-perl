@@ -1320,7 +1320,7 @@ sub get_submission_changes {
     {}, $since_modseq);
 }
 
-my $USER_SCHEMA_VERSION = 14;
+my $USER_SCHEMA_VERSION = 15;
 
 # Bounded IN batches keep metadata/membership/thread reads below SQLite's
 # variable limit. Only internal, fixed identifiers may reach this helper.
@@ -1403,6 +1403,19 @@ sub _create_email_query_tables {
   $dbh->do("CREATE INDEX IF NOT EXISTS jemailthreadactive ON jmessages(COALESCE(thrid,''),msgid) WHERE active=1");
   $dbh->do('CREATE INDEX IF NOT EXISTS jemailmembership ON jmessagemap(jmailboxid,msgid) WHERE active=1');
   $dbh->do('CREATE INDEX IF NOT EXISTS jemailmodseq ON jmessages(jmodseq)');
+}
+
+sub _create_replica_catalog_clock {
+  my ($Self,$dbh)=@_;
+  $dbh->do('CREATE TABLE IF NOT EXISTS jreplicacatalog(singleton INTEGER PRIMARY KEY CHECK(singleton=1),generation INTEGER NOT NULL)');
+  $dbh->do('INSERT OR IGNORE INTO jreplicacatalog(singleton,generation) VALUES(1,0)');
+  $dbh->do('CREATE TRIGGER IF NOT EXISTS jreplica_message_insert AFTER INSERT ON jmessages WHEN NEW.active=1
+    BEGIN UPDATE jreplicacatalog SET generation=generation+1 WHERE singleton=1; END');
+  $dbh->do('CREATE TRIGGER IF NOT EXISTS jreplica_message_delete AFTER DELETE ON jmessages WHEN OLD.active=1
+    BEGIN UPDATE jreplicacatalog SET generation=generation+1 WHERE singleton=1; END');
+  $dbh->do('CREATE TRIGGER IF NOT EXISTS jreplica_message_active AFTER UPDATE OF active,msgid ON jmessages
+    WHEN OLD.active IS NOT NEW.active OR OLD.msgid IS NOT NEW.msgid
+    BEGIN UPDATE jreplicacatalog SET generation=generation+1 WHERE singleton=1; END');
 }
 
 sub save_query {
@@ -1524,6 +1537,7 @@ EOF
 
   $dbh->do("CREATE INDEX IF NOT EXISTS msgidmap ON jmessagemap (msgid)");
   $Self->_create_email_query_tables($dbh);
+  $Self->_create_replica_catalog_clock($dbh);
 
   $dbh->do(<<EOF);
 CREATE TABLE IF NOT EXISTS account (
@@ -1770,6 +1784,7 @@ sub _initdb {
   my $dbh = shift;
 
   my ($v) = $dbh->selectrow_array('PRAGMA user_version');
+  die "Account database newer than this bridge\n" if $v>$USER_SCHEMA_VERSION;
 
   if ($v == 0) {
     # Fresh install — create full schema at version 1 (the baseline).
@@ -1978,6 +1993,15 @@ EOF
       $dbh->commit;
     };
     if ($@) { $dbh->rollback; die "user DB migration to v14 failed\n" }
+  }
+  if ($v < 15) {
+    $dbh->begin_work;
+    eval {
+      $Self->_create_replica_catalog_clock($dbh);
+      $dbh->do('PRAGMA user_version=15');
+      $dbh->commit;
+    };
+    if ($@) {$dbh->rollback;die "user DB migration to v15 failed\n"}
   }
 }
 

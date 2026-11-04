@@ -42,7 +42,8 @@ sub _base {
     'SELECT ifolderid,uidvalidity,uidfirst,uidnext,highestmodseq FROM ifolders ORDER BY ifolderid') : [];
   my $base=sha256_hex($json->encode({email=>$user->{jstateEmail}, mailbox=>$user->{jstateMailbox},
     generation=>$generation, attachments=>$self->{plan}{attachment_generation} ? $attachments : 0,
-    account=>$db->accountid,folders=>$folders}));
+    account=>$db->accountid,folders=>$folders,
+    replica=>@{$self->{plan}{terms}} && $db->can('local_search_generation') ? $db->local_search_generation : ''}));
   return ($base, $user->{jhighestmodseq});
 }
 

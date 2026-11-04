@@ -708,6 +708,45 @@ sub imap_update {
   return \%res;
 }
 
+# Full-message acquisition for the replica worker. The IMAP library streams
+# the literal directly to an already-open SSD spool, never through JSON IPC.
+sub imap_stream_raw {
+  my ($Self,$imapname,$expected_validity,$uid,$expected_bytes,$fh)=@_;
+  die "Invalid raw fetch identity\n" unless $uid=~/^\d+$/ && $uid>0 && $expected_bytes=~/^\d+$/;
+  my $imap=$Self->connect_imap;
+  my $ok=eval {
+    $imap->examine($imapname) or die "Replica EXAMINE failed\n";
+    die "Replica UIDVALIDITY changed\n" unless $imap->get_response_code('uidvalidity')==$expected_validity;
+    my $seen=0;
+    $imap->literal_handle_control(sub {
+      my ($bytes,$atom)=@_;
+      die "Unexpected replica literal\n" unless lc($atom//'') eq 'body[]' && !$seen++ && $bytes==$expected_bytes;
+      return $fh;
+    });
+    my $data=$imap->fetch({FullBody=>1},$uid,'body.peek[]');
+    $imap->literal_handle_control(0);
+    die "Replica fetch failed\n" if $imap->get_last_error;
+    die "Replica UID disappeared\n" unless ref($data) eq 'HASH' && ref($data->{$uid}) eq 'HASH';
+    my $body=$data->{$uid}{'body[]'};
+    unless ($seen) {
+      die "Invalid replica body\n" unless defined($body) && !ref($body) && length($body)==$expected_bytes;
+      print {$fh} $body or die "Replica spool write failed\n";
+    }
+    $fh->flush or die "Replica spool flush failed\n";
+    die "Replica raw length mismatch\n" unless -s $fh == $expected_bytes;
+    $Self->_unselect($imap);1;
+  };
+  my $error=$@;
+  unless ($ok) {
+    $imap->literal_handle_control(0);
+    # A rejected literal leaves the protocol unread; never reuse that socket.
+    delete $Self->{imap};
+    eval {my $socket=$imap->release_socket;$socket->close if $socket};
+    die $error;
+  }
+  return {bytes=>0+$expected_bytes};
+}
+
 sub imap_fill {
   my $Self = shift;
   my $imapname = shift;

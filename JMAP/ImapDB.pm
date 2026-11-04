@@ -3113,6 +3113,10 @@ sub calclabels {
   my $forcelabel = shift;
   my $data = shift;
 
+  # Gmail returns the complete label set on every label view. A folder-local
+  # override would turn an authoritative removal into stale unioned labels.
+  return @{$data->{'x-gm-labels'}} if $Self->{is_gmail} && ref($data->{'x-gm-labels'}) eq 'ARRAY';
+
   return ($forcelabel) if $forcelabel;
   return (@{$data->{'x-gm-labels'}}) if $data->{'x-gm-labels'};
   die "No way to calculate labels for " . Dumper($data);
@@ -3281,7 +3285,34 @@ sub prepare_provider_query {
   $dbh->do('CREATE TEMP TABLE IF NOT EXISTS jmap_provider_hits(term INTEGER NOT NULL,msgid TEXT NOT NULL,PRIMARY KEY(term,msgid)) WITHOUT ROWID');
   $dbh->do('CREATE TEMP TABLE IF NOT EXISTS jmap_provider_uids(uid INTEGER PRIMARY KEY)');
   $dbh->do('DELETE FROM temp.jmap_provider_hits');
+  my ($shadow,$shadow_ready);
+  if (my $replica=$Self->local_replica) {
+    $Self->begin_read;
+    my $catalog=JMAP::Replica->catalog_token($Self);
+    my $coverage=$replica->coverage($catalog);
+    $Self->commit;
+    if ($coverage->{mode} eq 'local') {
+      die "Local search temporarily unavailable: replica coverage incomplete\n" unless $coverage->{ready};
+      $dbh->do('PRAGMA query_only=OFF');
+      return $replica->insert_hits($dbh,$terms);
+    }
+    if ($coverage->{mode} eq 'shadow') {$shadow=$replica;$shadow_ready=$coverage->{ready}}
+  }
   for my $term (0..$#$terms) {$Self->_imap_search_into($term,@{$terms->[$term]})}
+  if ($shadow && $shadow_ready) {
+    my $ok=eval {
+      $dbh->do('PRAGMA query_only=OFF');
+      $dbh->do('CREATE TEMP TABLE IF NOT EXISTS jmap_shadow_hits(term INTEGER NOT NULL,msgid TEXT NOT NULL,PRIMARY KEY(term,msgid)) WITHOUT ROWID');
+      $dbh->do('DELETE FROM temp.jmap_shadow_hits');
+      $shadow->insert_hits($dbh,$terms,'jmap_shadow_hits');
+      my ($provider_only)=$dbh->selectrow_array('SELECT count(*) FROM (SELECT term,msgid FROM temp.jmap_provider_hits EXCEPT SELECT term,msgid FROM temp.jmap_shadow_hits)');
+      my ($local_only)=$dbh->selectrow_array('SELECT count(*) FROM (SELECT term,msgid FROM temp.jmap_shadow_hits EXCEPT SELECT term,msgid FROM temp.jmap_provider_hits)');
+      warn JSON::XS::encode_json({event=>'replica_shadow',account_key=>Digest::SHA::sha256_hex($Self->accountid),
+        query_key=>Digest::SHA::sha256_hex($json->encode($terms)),provider_only=>$provider_only,local_only=>$local_only})."\n";
+      1;
+    };
+    warn "Replica shadow comparison unavailable\n" unless $ok;
+  }
   my $sha=Digest::SHA->new(256);
   my $rows=$dbh->prepare('SELECT term,msgid FROM temp.jmap_provider_hits ORDER BY term,msgid');
   $rows->execute;
@@ -3290,6 +3321,22 @@ sub prepare_provider_query {
   }
   $rows->finish;
   return $sha->hexdigest;
+}
+
+# Read the SSD replica only. Missing/malformed local mode must never silently
+# fall through to a provider request or claim a successful empty search.
+sub local_replica {
+  my ($Self)=@_;
+  require JMAP::Replica;
+  my $path="$JMAP::DB::DATADIR/".$Self->accountid.'/replica.sqlite3';
+  return JMAP::Replica->new(path=>$path,read_only=>1);
+}
+
+sub local_search_generation {
+  my ($Self)=@_;
+  my $replica=$Self->local_replica or return 'provider';
+  my $state=$replica->state;
+  return join(':',@$state{qw(mode generation inventory_complete)},$state->{catalog_state}//'');
 }
 
 sub _imap_search_into {
@@ -3698,6 +3745,14 @@ sub sync_jmap_msgid {
   my ($msgid) = @_;
 
   my $imessages = $Self->dget('imessages', { msgid => $msgid }, 'flags, labels');
+  if ($Self->{is_gmail} && @$imessages) {
+    # Gmail flags/labels describe one provider message, not independent IMAP
+    # copies. Never resurrect a removed flag/label by unioning an older view.
+    $imessages=$Self->dbh->selectall_arrayref("SELECT i.flags,i.labels FROM imessages i
+      JOIN ifolders f USING(ifolderid) WHERE i.msgid=? ORDER BY i.mtime DESC,
+      CASE lower(f.label) WHEN '\\allmail' THEN 0 WHEN '\\trash' THEN 1 WHEN '\\spam' THEN 1 WHEN '\\junk' THEN 1 ELSE 2 END,
+      i.imessageid DESC LIMIT 1",{Slice=>{}},$msgid);
+  }
 
   my %labels;
   my %flags;
@@ -3819,8 +3874,9 @@ sub fill_messages {
 
   my %result;
   my @need;
+  my $replica=$Self->local_replica;
   for my $msgid (@ids) {
-    my $msg = $Self->read_parsed_msg($msgid);
+    my $msg = ($replica ? $replica->parsed_message($msgid) : undef) || $Self->read_parsed_msg($msgid);
     if ($msg) {
       $result{$msgid} = $msg;
     } else {

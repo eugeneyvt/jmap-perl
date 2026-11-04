@@ -1,0 +1,40 @@
+use strict;
+use warnings;
+use Test::More;
+use DBI;
+BEGIN {require File::Temp;$ENV{JMAP_DATADIR}=File::Temp::tempdir(CLEANUP=>1);$ENV{JMAP_SECRET_KEY}='b'x64}
+use JMAP::ImapDB;
+use JMAP::Replica;
+my $db=JMAP::ImapDB->new('clock');
+$db->setuser({username=>'synthetic',password=>'synthetic',imapHost=>'example.invalid'});
+$db->begin;
+$db->dmake('jmessages',{msgid=>'stable-id',thrid=>'stable-thread',keywords=>'{}'});
+my $message=$db->dgetone('jmessages',{msgid=>'stable-id'});
+for my $trigger (qw(jreplica_message_insert jreplica_message_delete jreplica_message_active)) {$db->dbh->do("DROP TRIGGER $trigger")}
+$db->dbh->do('DROP TABLE jreplicacatalog');$db->dbh->do('PRAGMA user_version=14');$db->commit;
+$db=JMAP::ImapDB->new('clock');$db->begin_read;
+is($db->dbh->selectrow_array('PRAGMA user_version'),15,'v14 upgrades to v15');
+is_deeply($db->dgetone('jmessages',{msgid=>'stable-id'}),$message,'old stable message ID and metadata preserved');
+my $base=JMAP::Replica->catalog_token($db);$db->commit;
+$db->begin;$db->ddirty('jmessages',{keywords=>'{}'},{msgid=>'stable-id'});$db->commit;
+$db->begin_read;is(JMAP::Replica->catalog_token($db),$base,'flag-only modseq changes do not invalidate raw coverage');$db->commit;
+$db->begin;$db->dmake('jmessages',{msgid=>'new',thrid=>'thread',keywords=>'{}'});$db->commit;
+$db->begin_read;isnt(JMAP::Replica->catalog_token($db),$base,'new active mail invalidates raw coverage');$db->commit;
+my $second;
+$db->begin_read;$second=JMAP::Replica->catalog_token($db);$db->commit;
+$db->begin;$db->dbh->do("UPDATE jmessages SET active=0 WHERE msgid='new'");$db->commit;
+$db->begin_read;isnt(JMAP::Replica->catalog_token($db),$second,'deactivation invalidates coverage');$db->commit;
+$db->begin;
+for my $trigger (qw(jreplica_message_insert jreplica_message_delete jreplica_message_active)) {$db->dbh->do("DROP TRIGGER $trigger")}
+$db->dbh->do('DROP TABLE jreplicacatalog');$db->dbh->do('PRAGMA user_version=14');$db->commit;
+my $raw=DBI->connect("dbi:SQLite:dbname=$ENV{JMAP_DATADIR}/clock.sqlite3",undef,undef,{RaiseError=>1,PrintError=>0});
+$raw->{Callbacks}={do=>sub {die "injected trigger DDL failure\n" if $_[1]=~/CREATE TRIGGER IF NOT EXISTS jreplica_message_delete/;return}};
+eval {$db->_initdb($raw)};
+like($@,qr/migration to v15 failed/,'trigger failure aborts migration');
+is($raw->selectrow_array('PRAGMA user_version'),14,'failed migration does not advance version');
+is($raw->selectrow_array("SELECT count(*) FROM sqlite_master WHERE name='jreplicacatalog'"),0,'table and earlier trigger rolled back');
+is($raw->selectrow_array("SELECT count(*) FROM jmessages WHERE msgid='stable-id'"),1,'failed migration retains original mail');
+$raw->{Callbacks}=undef;$raw->disconnect;
+$db=JMAP::ImapDB->new('clock');$db->begin_read;
+is($db->dbh->selectrow_array('PRAGMA user_version'),15,'clean retry succeeds');$db->commit;
+done_testing;

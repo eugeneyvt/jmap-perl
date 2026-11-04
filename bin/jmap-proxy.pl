@@ -778,6 +778,12 @@ sub run_backend_worker {
         return ['filenode_put', $db->put_filenode_content($args->{id}, $bytes, $args->{type})];
       }
       if ($cmd eq 'download') {
+        if ($db->isa('JMAP::ImapDB') && $ENV{JMAP_RAW_ROOT}) {
+          require JMAP::ReplicaContent;
+          my $file=eval {JMAP::ReplicaContent->download($db,$args->{blobId})};
+          return ['download',{status=>503,error=>'Mail content temporarily unavailable'}] if $@;
+          return ['download',$file] if $file;
+        }
         if ($db->can('proxy_blob')) {
           my ($dtype, $content) = $db->proxy_blob(
             $args->{blobId}, $args->{name}, $args->{type});
@@ -1474,6 +1480,9 @@ sub send_backend_request {
   my $args = shift;
   my $cb = shift;
   my $errcb = shift;
+  # Storage Box reads have a dedicated cancellable process. Search/sync/API
+  # account workers never wait behind an uncached attachment's FUSE operation.
+  $accountid.=':content' if $ENV{JMAP_RAW_ROOT} && $request eq 'download' && $accountid!~/:/;
   my $bytes = length(JSON::XS::encode_json($args));
   if (my $why = $runtime_policy->admission($accountid, $bytes, scalar(keys %worker_names), exists $backend{$accountid})) {
     $runtime_health->{rejected}++;
@@ -2459,6 +2468,16 @@ sub do_raw {
         # JMAP_FILES_MAX_BYTES: 501, streaming not implemented)
         return $req->respond([$result->{status}, 'error', { 'Content-Type' => 'text/plain' }, $result->{error} // "error $result->{status}"])
           if ref $result eq 'HASH' && $result->{status};
+        if (ref($result) eq 'HASH' && $result->{file}) {
+          require JMAP::FileResponse;
+          my ($bytes,$body)=eval {JMAP::FileResponse->prepare($datadir,$accountid,$result)};
+          return $req->respond([503,'unavailable',{},'Mail content temporarily unavailable']) if $@;
+          (my $enc_name=$name)=~s/([^\w.\-])/sprintf('%%%02X',ord($1))/ge;
+          return $req->respond([200,'ok',{
+            'Content-Type'=>$result->{type}||'application/octet-stream','Content-Length'=>$bytes,
+            'Content-Disposition'=>"attachment; filename*=UTF-8''$enc_name",
+            'Cache-Control'=>'private, immutable, max-age=31536000'},$body]);
+        }
         # RFC 8620 S6.2: no blob, no data -- that is not a 200.
         return $req->respond([404, 'not found', {}, 'not found'])
           unless ref $result eq 'ARRAY' && defined $result->[1];

@@ -20,7 +20,7 @@ sub new {
 sub role {
   my ($name) = @_;
   return 'accounts' if $name eq '__accounts__';
-  return $1 if $name =~ /:(idle|sync|backfill)$/;
+  return $1 if $name =~ /:(idle|sync|backfill|content)$/;
   return 'api';
 }
 sub safe_read {

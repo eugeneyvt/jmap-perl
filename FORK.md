@@ -52,6 +52,10 @@ to reproduce the image.
 
 ## Images and releases
 
+**Work in progress, 2026-11-04:** [hybrid replica and local FTS](docs/stage3-replica.md),
+schema15, stacked on the reliability/query candidates. This is not a published,
+accepted or production-installed release.
+
 **Unpublished candidate, 2026-11-04:** [stage 1 reliability](docs/stage1-reliability.md)
 adds atomic cache writes, post-commit notifications, bounded work/deadlines,
 private readiness/metrics and a durable SMTP-attempt journal (schema v13).

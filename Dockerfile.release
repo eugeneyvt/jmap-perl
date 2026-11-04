@@ -2,7 +2,7 @@
 # installed into a clean path so deleted upstream modules cannot linger.
 FROM ghcr.io/jmapio/jmap-proxy@sha256:74e2957eca8a340d7eb5cf06fa48f6bea6e2f1e6839361d582626405c0e6df1f
 
-RUN apt-get update && apt-get install -y --no-install-recommends libtext-diff-perl && \
+RUN apt-get update && apt-get install -y --no-install-recommends libtext-diff-perl libmime-tools-perl && \
     rm -rf /var/lib/apt/lists/*
 
 COPY . /opt/binarybay-jmap

@@ -27,6 +27,16 @@ my $r={read_only=>JSON::XS::true,account_key=>substr(sha256_hex($account),0,16),
   outbox=>{manifest_rows=>0,missing=>0,hash_mismatch=>0,legacy_unverified=>0,orphan_files=>0},
   staging_files=>0,raw_mirror=>'not_implemented'};
 my $base=File::Spec->catdir($root,$account);
+my $replica_path=File::Spec->catfile($base,'replica.sqlite3');
+my $replica;
+if (-f $replica_path) {
+  require JMAP::Replica;
+  $replica=JMAP::Replica->new(path=>$replica_path,read_only=>1);
+  $r->{raw_mirror}={mode=>$replica->state->{mode},
+    jobs=>$replica->{dbh}->selectall_arrayref('SELECT state,count(*),coalesce(sum(bytes),0) FROM replica_jobs GROUP BY state'),
+    indexed=>0+$replica->{dbh}->selectrow_array('SELECT count(*) FROM replica_documents'),
+    raw_checksums_checked=>JSON::XS::false};
+}
 my $parsed=File::Spec->catdir($base,'parsed');
 if (-d $parsed) {
   opendir(my $dir,$parsed) or die "Cannot inspect parsed cache\n";
@@ -47,7 +57,13 @@ if (-d $parsed) {
 }
 my $manifest=$db->selectcol_arrayref('SELECT msgid FROM jrawmessage');
 for my $id (@$manifest) {
-  $r->{parsed}{metadata_without_file}++ unless -f File::Spec->catfile($parsed,"$id.json");
+    unless (-f File::Spec->catfile($parsed,"$id.json")) {
+      my $present=0;
+      if ($replica) {
+        ($present)=$replica->{dbh}->selectrow_array('SELECT 1 FROM replica_documents WHERE msgid=? AND payload IS NOT NULL',{},$id);
+      }
+      $r->{parsed}{metadata_without_file}++ unless $present;
+    }
 }
 my ($journal)=$db->selectrow_array("SELECT 1 FROM sqlite_master WHERE type='table' AND name='jdelivery'");
 my %held;

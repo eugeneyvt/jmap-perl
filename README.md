@@ -10,6 +10,9 @@ and must not be deployed with the existing image-only controller unchanged.
 The stacked [stage 2 query candidate](docs/stage2-query-planner.md) adds SQL
 pagination/snapshots, batched provider-ID mapping and durable list summaries
 (schema v14). Production deployment is separate from this candidate work.
+The following [hybrid replica candidate](docs/stage3-replica.md) adds guarded
+Storage Box originals, SSD text/FTS, durable jobs and streaming content workers
+(schema v15). It is incomplete and is not installed on Unit S.
 
 The upstream README follows. Its feature claims are not a guarantee of Frappe
 Suite interoperability; the acceptance limits in FORK.md apply to this fork.

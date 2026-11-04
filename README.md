@@ -7,6 +7,9 @@ Published images: `ghcr.io/eugeneyvt/jmap-proxy` (`stable`, version tags, `edge`
 Local, unpublished work for the first reliability stage is described in
 [stage1-reliability.md](docs/stage1-reliability.md). It includes a schema change
 and must not be deployed with the existing image-only controller unchanged.
+The stacked [stage 2 query candidate](docs/stage2-query-planner.md) adds SQL
+pagination/snapshots, batched provider-ID mapping and durable list summaries
+(schema v14). Production deployment is separate from this candidate work.
 
 The upstream README follows. Its feature claims are not a guarantee of Frappe
 Suite interoperability; the acceptance limits in FORK.md apply to this fork.

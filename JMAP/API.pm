@@ -47,6 +47,16 @@ my %PARAM_SCHEMA = (
     collapseThreads    => 'bool?',
     calculateTotal     => 'bool?',
   },
+  'Email/queryChanges' => {
+    accountId          => 'string?',
+    filter             => 'object?',
+    sort               => '[object]?',
+    sinceQueryState    => 'string',
+    maxChanges         => 'uint?',
+    upToId             => 'string?',
+    calculateTotal     => 'bool?',
+    collapseThreads    => 'bool?',
+  },
   'Email/set' => {
     accountId          => 'string?',
     ifInState          => 'string?',
@@ -629,9 +639,13 @@ sub idmap {
 }
 
 sub _api_init {
-  my ($Self, $args) = @_;
-  $Self->begin();
+  my ($Self, $args, $readonly) = @_;
+  $readonly ? $Self->{db}->begin_read : $Self->begin();
   my $user      = $Self->{db}->get_user();
+  if (!$user && $readonly) {
+    $Self->commit; $Self->begin; $Self->{db}->get_user; $Self->commit;
+    $Self->{db}->begin_read; $user=$Self->{db}->get_user;
+  }
   my $accountid = $Self->{db}->accountid();
   return (undef, undef)
     if ($args->{accountId} and $args->{accountId} ne $accountid);

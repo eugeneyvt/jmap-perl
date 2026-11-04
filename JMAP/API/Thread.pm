@@ -12,7 +12,7 @@ sub api_Thread_get {
   my $Self = shift;
   my $args = shift;
 
-  my ($user, $accountid) = $Self->_api_init($args);
+  my ($user, $accountid) = $Self->_api_init($args,1);
   return $Self->_transError(['error', {type => 'accountNotFound'}]) unless defined $accountid;
 
   my $newState = "$user->{jstateThread}";
@@ -27,10 +27,16 @@ sub api_Thread_get {
   else {
     @thrids = map { $_->{thrid} } @{$Self->{db}->dget('jthreads', { active => 1 }, 'thrid')};
   }
+  my %threads=map {$_->{thrid}=>$_->{data}}
+    @{$Self->{db}->rows_for_ids('jthreads','thrid',\@thrids,'thrid,data',1)};
+  my %dates;
+  for my $m (@{$Self->{db}->rows_for_ids('jmessages','thrid',\@thrids,'thrid,msgid,internaldate',1)}) {
+    $dates{$m->{thrid}}{$m->{msgid}}=$m->{internaldate} // 0;
+  }
   foreach my $thrid (@thrids) {
     next if $seenids{$thrid};
     $seenids{$thrid} = 1;
-    my $data = $Self->{db}->dgetfield('jthreads', { thrid => $thrid, active => 1 }, 'data');
+    my $data = $threads{$thrid};
     unless ($data) {
       $missingids{$thrid} = 1;
       next;
@@ -38,8 +44,7 @@ sub api_Thread_get {
     my $jdata = $json->decode($data);
     # RFC 8621 S3: "sorted by the receivedAt date of the Email, oldest first",
     # ties broken stably (by id).
-    my %date = map { $_->{msgid} => $_->{internaldate} // 0 }
-               @{$Self->{db}->dget('jmessages', { thrid => $thrid, active => 1 }, 'msgid,internaldate')};
+    my %date = %{$dates{$thrid} || {}};
     my @ids = sort { ($date{$a} // 0) <=> ($date{$b} // 0) || $a cmp $b } @$jdata;
     push @list, {
       id => "$thrid",

@@ -35,6 +35,7 @@ use Data::JSEmail;
 use JMAP::AtomicFile;
 use JMAP::Telemetry;
 use JMAP::SQLProfile;
+use JMAP::Collation;
 
 my $json = JSON::XS->new->utf8->canonical();
 
@@ -68,8 +69,48 @@ sub new {
   my $initializing = IO::LockedFile->new(">$DATADIR/$accountid.lock") or die "Account initialization lock unavailable\n";
   my $dbh = DBI->connect("dbi:SQLite:dbname=$DATADIR/$accountid.sqlite3", undef, undef,
     {RaiseError=>1, PrintError=>0});
+  $Self->_configure_connection($dbh);
   $Self->_initdb($dbh);
+  $Self->{connection} = $dbh;
+  $Self->{connection_pid} = $$;
   return $Self;
+}
+
+sub _configure_connection {
+  my ($Self, $dbh) = @_;
+  my $timeout = $ENV{JMAP_SQLITE_BUSY_TIMEOUT_MS} // 5000;
+  die "Invalid SQLite busy timeout\n" unless $timeout =~ /^\d+$/ && $timeout <= 30000;
+  $dbh->sqlite_busy_timeout($timeout);
+  $dbh->do('PRAGMA temp_store=FILE');
+  $dbh->do('PRAGMA cache_size=-8192');
+  $dbh->sqlite_create_function('jmap_keyword', 2, sub {
+    my ($encoded, $keyword) = @_;
+    my $value = decode_json($encoded || '{}');
+    return $value->{$keyword} ? 1 : 0;
+  });
+  for my $collation (JMAP::Collation::supported()) {
+    (my $name = $collation) =~ s/[^a-z0-9]/_/g;
+    $dbh->sqlite_create_collation('jmap_' . $name, sub {
+      JMAP::Collation::compare($collation, $_[0], $_[1]);
+    });
+  }
+}
+
+sub _connection {
+  my ($Self) = @_;
+  if ($Self->{connection} && $Self->{connection_pid} != $$) {
+    # Never use or roll back a connection inherited across fork.
+    $Self->{connection}{InactiveDestroy} = 1;
+    delete $Self->{connection};
+  }
+  unless ($Self->{connection}) {
+    my $dbh = DBI->connect("dbi:SQLite:dbname=$DATADIR/" . $Self->accountid . '.sqlite3',
+      undef, undef, {RaiseError=>1, PrintError=>0});
+    $Self->_configure_connection($dbh);
+    $Self->{connection} = $dbh;
+    $Self->{connection_pid} = $$;
+  }
+  return $Self->{connection};
 }
 
 sub _acct_dir {
@@ -140,6 +181,11 @@ sub unlink_jcontact_payload{ $_[0]->unlink_subdir('jcontacts',"$_[1].json") }
 sub delete {
   my $Self = shift;
   my $accountid = $Self->accountid();
+  $Self->reset if $Self->in_transaction;
+  if (my $connection=delete $Self->{connection}) {
+    if ($Self->{connection_pid}==$$) {$connection->disconnect}
+    else {$connection->{InactiveDestroy}=1}
+  }
   delete $Self->{dbh};
   unlink("$DATADIR/$accountid.sqlite3");
   my $dir = "$DATADIR/$accountid";
@@ -195,18 +241,26 @@ sub begin_superlock {
 }
 
 sub begin {
-  my $Self = shift;
+  return $_[0]->_begin(0);
+}
+
+sub begin_read { return $_[0]->_begin(1) }
+
+sub _begin {
+  my ($Self, $readonly) = @_;
   confess("ALREADY IN TRANSACTION") if $Self->{t};
   my $accountid = $Self->accountid();
   # we need this because sqlite locking isn't as robust as you might hope
   my $started = JMAP::Telemetry::now();
-  my $lock = $Self->{superlock} || IO::LockedFile->new(">$DATADIR/$accountid.lock")
+  my $mode = $readonly ? '<' : '>';
+  my $lock = $Self->{superlock} || IO::LockedFile->new("$mode$DATADIR/$accountid.lock")
     or die "Account lock unavailable\n";
-  $Self->{t} = {lock => $lock};
+  $Self->{t} = {lock => $lock, readonly => $readonly};
   JMAP::Telemetry::record('lock', JMAP::Telemetry::now() - $started);
   $Self->{t}{started} = JMAP::Telemetry::now();
-  $Self->{t}{dbh} = DBI->connect("dbi:SQLite:dbname=$DATADIR/$accountid.sqlite3", undef, undef,
-    {RaiseError=>1, PrintError=>0});
+  $Self->{t}{dbh} = $Self->_connection;
+  $Self->{t}{dbh}->do('PRAGMA query_only=' . ($readonly ? 'ON' : 'OFF'));
+  $Self->{t}{dbh}{sqlite_use_immediate_transaction} = $readonly ? 0 : 1;
   $Self->{t}{dbh}{Profile} = JMAP::SQLProfile->new();
   $Self->{t}{dbh}->begin_work();
 }
@@ -279,6 +333,7 @@ sub reset {
   $Self->{t}{dbh}->rollback() if $Self->{t}{dbh};
   $Self->{t}{dbh}{Profile}->collect() if $Self->{t}{dbh} && $Self->{t}{dbh}{Profile};
   delete $Self->{t};
+  delete $Self->{connection}; # Error recovery gets a clean connection next time.
 }
 
 sub dirty {
@@ -301,6 +356,7 @@ sub get_user {
   }
   # bootstrap
   unless ($Self->{t}{user}) {
+    return undef if $Self->{t}{readonly};
     my $data = {
       jhighestmodseq => 1,
     };
@@ -1264,7 +1320,89 @@ sub get_submission_changes {
     {}, $since_modseq);
 }
 
-my $USER_SCHEMA_VERSION = 13;
+my $USER_SCHEMA_VERSION = 14;
+
+# Bounded IN batches keep metadata/membership/thread reads below SQLite's
+# variable limit. Only internal, fixed identifiers may reach this helper.
+sub rows_for_ids {
+  my ($Self, $table, $field, $ids, $columns, $active) = @_;
+  die "Invalid table identifier\n" unless $table =~ /^(?:jmessages|jmessagemap|jthreads|imessages|ifolders|jemailsummary|jrawmessage)$/;
+  die "Invalid field identifier\n" unless $field =~ /^(?:msgid|thrid|ifolderid)$/;
+  die "Invalid projection\n" unless $columns =~ /^[a-zA-Z0-9_, *]+$/;
+  my %seen; my @ids = grep { defined && !$seen{$_}++ } @$ids;
+  my @rows;
+  while (@ids) {
+    my @batch = splice(@ids, 0, 400);
+    my $sql = "SELECT $columns FROM $table WHERE $field IN (" . join(',', ('?') x @batch) . ')';
+    $sql .= ' AND active=1' if $active;
+    push @rows, @{$Self->dbh->selectall_arrayref($sql, {Slice=>{}}, @batch)};
+  }
+  return \@rows;
+}
+
+sub advance_search_generation {
+  my ($Self) = @_;
+  $Self->dbh->do('UPDATE jemailqueryclock SET generation=generation+1 WHERE singleton=1');
+}
+
+# Immutable list properties survive eviction/corruption of the parsed-body file.
+# Caller groups this with the ordinary cache metadata transaction.
+sub _summary_payload {
+  my ($m)=@_;
+  my %summary=map {$_=>$m->{$_}} qw(preview hasAttachment messageId inReplyTo references sender replyTo);
+  $summary{attachments}=$m->{attachments} || [];
+  return $json->encode(\%summary);
+}
+
+sub message_summary_updates {
+  my ($Self,$messages)=@_;
+  my @ids=keys %$messages;
+  my %stored=map {$_->{msgid}=>$_->{payload}} @{$Self->rows_for_ids('jemailsummary','msgid',\@ids,'msgid,payload',0)};
+  my %raw=map {$_->{msgid}=>$_->{hasAttachment}} @{$Self->rows_for_ids('jrawmessage','msgid',\@ids,'msgid,hasAttachment',0)};
+  return {map {$_=>$messages->{$_}} grep {!exists($raw{$_}) || !exists($stored{$_}) ||
+    ($raw{$_} || 0)!=($messages->{$_}{hasAttachment} ? 1 : 0) || $stored{$_} ne _summary_payload($messages->{$_})} @ids};
+}
+
+sub cache_message_summaries {
+  my ($Self, $messages) = @_;
+  $messages=$Self->message_summary_updates($messages);
+  return unless keys %$messages;
+  my $changed = 0;
+  my @ids=keys %$messages;
+  my %previous=map {$_->{msgid}=>$_->{hasAttachment}}
+    @{$Self->rows_for_ids('jrawmessage','msgid',\@ids,'msgid,hasAttachment',0)};
+  my $statement = $Self->dbh->prepare('INSERT INTO jemailsummary(msgid,payload,mtime) VALUES(?,?,?)
+    ON CONFLICT(msgid) DO UPDATE SET payload=excluded.payload,mtime=excluded.mtime WHERE payload<>excluded.payload');
+  my $raw = $Self->dbh->prepare('INSERT INTO jrawmessage(msgid,hasAttachment,mtime) VALUES(?,?,?)
+    ON CONFLICT(msgid) DO UPDATE SET hasAttachment=excluded.hasAttachment,mtime=excluded.mtime');
+  for my $id (sort keys %$messages) {
+    my $m = $messages->{$id};
+    my $has = $m->{hasAttachment} ? 1 : 0;
+    $changed = 1 if ($previous{$id} || 0) != $has;
+    $statement->execute($id, _summary_payload($m), time());
+    $raw->execute($id, $has, time());
+  }
+  $Self->advance_search_generation if $changed;
+}
+
+sub _create_email_query_tables {
+  my ($Self, $dbh) = @_;
+  $dbh->do('CREATE TABLE IF NOT EXISTS jemailqueryclock(singleton INTEGER PRIMARY KEY CHECK(singleton=1),generation INTEGER NOT NULL)');
+  $dbh->do('INSERT OR IGNORE INTO jemailqueryclock VALUES(1,0)');
+  $dbh->do('CREATE TABLE IF NOT EXISTS jemailsummary(msgid TEXT PRIMARY KEY,payload TEXT NOT NULL,mtime INTEGER NOT NULL)');
+  $dbh->do('CREATE TABLE IF NOT EXISTS jemailqueries(querykey TEXT PRIMARY KEY,signature TEXT NOT NULL,state TEXT NOT NULL,base_state TEXT NOT NULL,
+    modseq INTEGER NOT NULL,created INTEGER NOT NULL,used INTEGER NOT NULL,total INTEGER NOT NULL,bytes INTEGER NOT NULL,
+    provider INTEGER NOT NULL)');
+  $dbh->do('CREATE INDEX IF NOT EXISTS jemailquerylookup ON jemailqueries(signature,state)');
+  $dbh->do('CREATE INDEX IF NOT EXISTS jemailqueryexpiry ON jemailqueries(used)');
+  $dbh->do('CREATE TABLE IF NOT EXISTS jemailqueryrows(querykey TEXT NOT NULL,position INTEGER NOT NULL,msgid TEXT NOT NULL,
+    PRIMARY KEY(querykey,position),UNIQUE(querykey,msgid)) WITHOUT ROWID');
+  $dbh->do('CREATE INDEX IF NOT EXISTS jemailreceiveddesc ON jmessages(COALESCE(internaldate,0) DESC,msgid ASC) WHERE active=1');
+  $dbh->do('CREATE INDEX IF NOT EXISTS jemailreceivedasc ON jmessages(COALESCE(internaldate,0) ASC,msgid ASC) WHERE active=1');
+  $dbh->do("CREATE INDEX IF NOT EXISTS jemailthreadactive ON jmessages(COALESCE(thrid,''),msgid) WHERE active=1");
+  $dbh->do('CREATE INDEX IF NOT EXISTS jemailmembership ON jmessagemap(jmailboxid,msgid) WHERE active=1');
+  $dbh->do('CREATE INDEX IF NOT EXISTS jemailmodseq ON jmessages(jmodseq)');
+}
 
 sub save_query {
   my ($Self, $type, $params, $state, $ids) = @_;
@@ -1384,6 +1522,7 @@ CREATE TABLE IF NOT EXISTS jmessagemap (
 EOF
 
   $dbh->do("CREATE INDEX IF NOT EXISTS msgidmap ON jmessagemap (msgid)");
+  $Self->_create_email_query_tables($dbh);
 
   $dbh->do(<<EOF);
 CREATE TABLE IF NOT EXISTS account (
@@ -1829,6 +1968,15 @@ EOF
       $dbh->commit or die "Delivery migration commit failed\n";
     };
     if ($@) { $dbh->rollback; die "user DB migration to v13 failed\n" }
+  }
+  if ($v < 14) {
+    $dbh->begin_work;
+    eval {
+      $Self->_create_email_query_tables($dbh);
+      $dbh->do('PRAGMA user_version=14');
+      $dbh->commit;
+    };
+    if ($@) { $dbh->rollback; die "user DB migration to v14 failed\n" }
   }
 }
 

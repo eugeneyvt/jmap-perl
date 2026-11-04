@@ -3267,7 +3267,34 @@ sub do_folder {
 }
 
 sub imap_search {
+  my ($Self,@search)=@_;
+  $Self->prepare_provider_query([\@search]);
+  my $ids=$Self->_connection->selectcol_arrayref('SELECT msgid FROM temp.jmap_provider_hits WHERE term=0');
+  return {map {$_=>1} @$ids};
+}
+
+sub prepare_provider_query {
+  my ($Self,$terms)=@_;
+  die "Provider search inside transaction\n" if $Self->in_transaction;
+  my $dbh=$Self->_connection;
+  $dbh->do('PRAGMA query_only=OFF');
+  $dbh->do('CREATE TEMP TABLE IF NOT EXISTS jmap_provider_hits(term INTEGER NOT NULL,msgid TEXT NOT NULL,PRIMARY KEY(term,msgid)) WITHOUT ROWID');
+  $dbh->do('CREATE TEMP TABLE IF NOT EXISTS jmap_provider_uids(uid INTEGER PRIMARY KEY)');
+  $dbh->do('DELETE FROM temp.jmap_provider_hits');
+  for my $term (0..$#$terms) {$Self->_imap_search_into($term,@{$terms->[$term]})}
+  my $sha=Digest::SHA->new(256);
+  my $rows=$dbh->prepare('SELECT term,msgid FROM temp.jmap_provider_hits ORDER BY term,msgid');
+  $rows->execute;
+  while (my $row=$rows->fetchrow_arrayref) {
+    $sha->add(pack('N',0+$row->[0]),pack('N',length($row->[1])),$row->[1]);
+  }
+  $rows->finish;
+  return $sha->hexdigest;
+}
+
+sub _imap_search_into {
   my $Self = shift;
+  my $term = shift;
   my @search = @_;
 
   if ($Self->{is_gmail}) {
@@ -3298,23 +3325,29 @@ sub imap_search {
   }
   $Self->commit();
 
-  my %matches;
   foreach my $item (@$data) {
     my $from = $item->{uidfirst};
     my $to = $item->{uidnext}-1;
     next if $from > $to;  # empty folder
     my $res = $Self->backend_cmd('imap_search', $item->{imapname}, 'uid', "$from:$to", @search);
-    # XXX - uidvaldity changed
-    next unless $res->[2] == $item->{uidvalidity};
+    die "Invalid provider search response\n" unless ref($res) eq 'ARRAY' && ref($res->[3]) eq 'ARRAY';
+    die "UIDVALIDITY changed during search; synchronize before retry\n"
+      unless defined($res->[2]) && $res->[2] == $item->{uidvalidity};
     $Self->begin();
-    foreach my $uid (@{$res->[3]}) {
-      my $msgid = $Self->dgetfield('imessages', { ifolderid => $item->{ifolderid}, uid => $uid }, 'msgid');
-      $matches{$msgid} = 1 if $msgid;
+    my $dbh=$Self->dbh;
+    $dbh->do('DELETE FROM temp.jmap_provider_uids');
+    for (my $offset=0;$offset<@{$res->[3]};$offset+=400) {
+      my $end=$offset+399; $end=$#{$res->[3]} if $end>$#{$res->[3]};
+      my @uids=@{$res->[3]}[$offset..$end];
+      die "Invalid provider UID\n" if grep { !defined($_) || $_ !~ /^\d+$/ || $_<1 } @uids;
+      $dbh->do('INSERT OR IGNORE INTO temp.jmap_provider_uids(uid) VALUES '.join(',',('( ? )') x @uids),{},@uids);
     }
+    # One indexed join per folder, instead of one metadata query per UID.
+    $dbh->do('INSERT OR IGNORE INTO temp.jmap_provider_hits(term,msgid)
+      SELECT ?,i.msgid FROM imessages i JOIN temp.jmap_provider_uids u ON u.uid=i.uid
+      WHERE i.ifolderid=? AND i.msgid IS NOT NULL',{},$term,$item->{ifolderid});
     $Self->commit();
   }
-
-  return \%matches;
 }
 
 sub mark_sync {
@@ -3405,10 +3438,7 @@ sub import_message {
   $Self->write_parsed_msg($msgdata->{msgid}, $message);
 
   $Self->begin();
-  $Self->dinsert('jrawmessage', {
-    msgid         => $msgdata->{msgid},
-    hasAttachment => $message->{hasAttachment},
-  });
+  $Self->cache_message_summaries({$msgdata->{msgid}=>$message});
   $Self->commit();
 
   return ($msgdata->{msgid}, $msgdata->{thrid}, $msgdata->{size});
@@ -3787,8 +3817,6 @@ sub fill_messages {
 
   return {} unless @ids;
 
-  $Self->begin();
-
   my %result;
   my @need;
   for my $msgid (@ids) {
@@ -3800,30 +3828,34 @@ sub fill_messages {
     }
   }
 
+  $Self->begin_read();
+
+  my $summary_updates=$Self->message_summary_updates(\%result);
+
   my %udata;
   if (@need) {
     # DBNOTE: because of IN not being supported
-    my $uids = $Self->dbh->selectall_arrayref("SELECT ifolderid, uid, msgid FROM imessages WHERE msgid IN (" . join(', ', map { "?" } @need) . ")", {}, @need);
+    my $uids = $Self->rows_for_ids('imessages','msgid',\@need,'ifolderid,uid,msgid',0);
     foreach my $row (@$uids) {
-      my ($ifolderid, $uid, $msgno) = @$row;
+      my ($ifolderid, $uid, $msgno) = @{$row}{qw(ifolderid uid msgid)};
       $udata{$ifolderid}{$uid} = $msgno;
     }
   }
 
   my %foldermap;
+  my @folderids=keys %udata;
+  my %folders=map {$_->{ifolderid}=>$_} @{$Self->rows_for_ids('ifolders','ifolderid',\@folderids,'ifolderid,imapname,uidvalidity',0)};
   foreach my $ifolderid (sort keys %udata) {
     my $uhash = $udata{$ifolderid};
     my $uids = join(',', sort { $a <=> $b } grep { not $result{$uhash->{$_}} } keys %$uhash);
     next unless $uids;
-    my $data = $Self->dgetone('ifolders', { ifolderid => $ifolderid }, 'imapname,uidvalidity');
+    my $data = $folders{$ifolderid};
     next unless $data;
     $foldermap{$ifolderid} = [$data->{imapname}, $data->{uidvalidity}];
   }
 
   # drop out of transaction to actually fetch the data
   $Self->commit();
-
-  return \%result unless keys %udata;
 
   my %parsed;
   foreach my $ifolderid (sort keys %udata) {
@@ -3851,15 +3883,11 @@ sub fill_messages {
     $Self->write_parsed_msg($msgid, $parsed{$msgid});
   }
 
-  $Self->begin();
-  foreach my $msgid (sort keys %parsed) {
-    my $message = $parsed{$msgid};
-    $Self->dinsert('jrawmessage', {
-      msgid        => $msgid,
-      hasAttachment => $message->{hasAttachment},
-    });
+  if (keys(%$summary_updates) || keys(%parsed)) {
+    $Self->begin();
+    $Self->cache_message_summaries({%$summary_updates,%parsed});
+    $Self->commit();
   }
-  $Self->commit();
 
   # XXX - handle not getting data that we need?
   my @stillneed = grep { not $result{$_} } @ids;

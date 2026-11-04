@@ -35,6 +35,11 @@ Completeness requires a parsed JMAP document, not only an indexed fragment.
 Parser upgrades invalidate coverage and requeue verified raw for local replay;
 older workers refuse a newer parser generation. Readiness and private metrics
 expose mode, generation, inventory and pending counts without email addresses.
+The parent preloads backend code before forking so cold workers inherit the
+read-mostly MIME/API heap. Account constructors, credentials and provider
+connections are still initialized only in the owning child. A throttled Linux
+diagnostic verifies actual post-timeout recovery with the two-second test
+deadline; no product timeout is lengthened to hide a cold bootstrap failure.
 
 `Mail::IMAPTalk::literal_handle_control` streams EXAMINE/BODY.PEEK originals to
 SSD without changing read flags or passing MIME through JSON. MIME-tools writes

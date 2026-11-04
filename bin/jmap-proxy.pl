@@ -50,8 +50,13 @@ use JMAP::Telemetry;
 use JMAP::RuntimePolicy;
 use JMAP::RuntimeHealth;
 
-# Backend modules (loaded in child after fork)
-# use JMAP::API; use JMAP::ImapDB; etc.
+# Load code once before forking. Loading the MIME/calendar/DB stack separately
+# in every cold worker costs seconds on a throttled CPU and prevents sharing
+# most of the immutable Perl heap. Constructors, account DBs, credentials and
+# provider sockets remain child-only; no live backend object is created here.
+use IO::Socket::SSL;
+use JMAP::API;
+use JMAP::ImapDB;
 
 my $BASEURL = $ENV{BASEURL} || 'http://localhost:' . ($ENV{JMAP_PORT} || 9000);
 my $jmaphome = $ENV{JMAP_HOME} || '/home/jmap/jmap-perl';

@@ -33,13 +33,15 @@ flock($lock,LOCK_EX|LOCK_NB) or die "Replica worker already running\n";
 my $started=time();
 # alarm is a useful application deadline; supervisor/container deadlines are
 # also required because FUSE operations can be stuck in kernel I/O.
-$SIG{ALRM}=sub {die "Replica run deadline exceeded\n"};alarm($max_seconds);
+my $timed_out=0;
+$SIG{ALRM}=sub {$timed_out=1;die "Replica run deadline exceeded\n"};alarm($max_seconds);
 my $store=JMAP::StorageBox->from_config(root=>$raw_root,mount=>$mount,marker=>$marker,marker_sha=>$marker_sha,account=>$account);
 $store->_root;
 my $db=JMAP::ImapDB->new($account);
 my $replica=JMAP::Replica->new(path=>"$base/replica.sqlite3");
 my $spool="$base/replica-spool";JMAP::AtomicFile->ensure_directory($spool);
 
+my $metadata_failed=0;
 if ($inventory) {
   # LIST all selectable folders. Gmail label copies retain X-GM-MSGID; Spam
   # and Trash are not omitted just because All Mail exists.
@@ -53,16 +55,30 @@ if ($inventory) {
   for my $folder (@$folders) {
     last if $steps >= $metadata_steps;
     my $label=($db->{is_gmail} && lc($folder->{label}//'') eq '\\allmail') ? undef : $folder->{label};
-    $db->do_folder($folder->{ifolderid},$label);$steps++;
+    my $scope_ok=eval {
+    $steps++;$db->do_folder($folder->{ifolderid},$label);
     my $folder_steps=0;
     while ($steps<$metadata_steps && $folder_steps<2) {
       $db->begin_read;my $f=$db->dgetone('ifolders',{ifolderid=>$folder->{ifolderid}});$db->commit;
       last if $f->{uidfirst}<=1;
-      $db->do_folder($f->{ifolderid},$label,500);$steps++;$folder_steps++;
+      $steps++;$folder_steps++;$db->do_folder($f->{ifolderid},$label,500);
     }
     $db->begin_read;my $current=$db->dgetone('ifolders',{ifolderid=>$folder->{ifolderid}});$db->commit;
     $replica->{dbh}->do('INSERT OR REPLACE INTO replica_scopes(folder,uidvalidity,uidnext,uidfirst,checked) VALUES(?,?,?,?,?)',{},
       @$current{qw(ifolderid uidvalidity uidnext uidfirst)},time());
+    1;
+    };
+    unless ($scope_ok) {
+      my $error=$@;
+      eval {$db->rollback} if $db->in_transaction;
+      die $error if $timed_out;
+      # One unavailable historical message must not starve other folders or
+      # already inventoried jobs. Revoke only its disposable scope attestation;
+      # no checkpoint, UID map, raw original, or queued source is discarded.
+      $replica->{dbh}->do('DELETE FROM replica_scopes WHERE folder=?',{},$folder->{ifolderid});
+      $metadata_failed++;
+      warn "Replica folder metadata unavailable; existing checkpoint retained\n";
+    }
   }
   $db->sync_jmap;
 }
@@ -87,12 +103,12 @@ while ($done+$failed<$max_messages && time()-$started<$max_seconds) {
 }
 alarm(0);
 my $reconciled=$replica->reconcile_catalog($db);
-my $complete=@{$reconciled->{scopes}} && !$reconciled->{missing} ? 1 : 0;
+my $complete=@{$reconciled->{scopes}} && !$reconciled->{missing} && !$metadata_failed ? 1 : 0;
 for my $folder (@{$reconciled->{scopes}}) {
   my $scope=$replica->{dbh}->selectrow_hashref('SELECT * FROM replica_scopes WHERE folder=?',{},$folder->{ifolderid});
   $complete=0 unless $scope && $scope->{uidfirst}<=1 && $scope->{uidvalidity}==$folder->{uidvalidity}
     && $scope->{uidnext}==$folder->{uidnext} && time()-$scope->{checked}<1800;
 }
 $replica->seal_catalog($reconciled->{token},$complete);
-print encode_json({completed=>$done,failed=>$failed,bytes=>$bytes,elapsed_seconds=>time()-$started}),"\n";
-exit($failed ? 2 : 0);
+print encode_json({completed=>$done,failed=>$failed,metadata_failed=>$metadata_failed,bytes=>$bytes,elapsed_seconds=>time()-$started}),"\n";
+exit($failed || $metadata_failed ? 2 : 0);

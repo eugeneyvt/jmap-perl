@@ -35,11 +35,11 @@ sub ingest {
     $self->{free_at} = $data->{sampled_at} // time();
   }
   if (ref($data->{delivery}) eq 'HASH') {
-    my $aid = $name; $aid =~ s/:(?:idle|sync|backfill|content)$//;
+    my $aid = $name; $aid =~ s/:(?:idle|sync|backfill|content|search)$//;
     $self->{delivery}{$aid} = {map {$_ => 0 + ($data->{delivery}{$_} // 0)} qw(pending prepared sending unknown confirmed canceled)};
   }
   if (ref($data->{replica}) eq 'HASH' && ($data->{replica}{mode}//'')=~/^(provider|shadow|local)$/) {
-    my $aid=$name;$aid=~s/:(?:idle|sync|backfill|content)$//;
+    my $aid=$name;$aid=~s/:(?:idle|sync|backfill|content|search)$//;
     my %sample=(mode=>$data->{replica}{mode},sampled_at=>$data->{sampled_at}//time());
     for my $field (qw(ready pending generation inventory_complete encoding_problem_documents)) {
       my $value=$data->{replica}{$field};
@@ -66,7 +66,7 @@ sub readiness {
     my $sync = $args{sync_times}{$aid};
     my $age = defined $sync ? $args{now} - $sync : undef;
     my $oldest = 0;
-    for my $name ($aid, map {"$aid:$_"} qw(sync backfill idle)) {
+    for my $name ($aid, map {"$aid:$_"} qw(sync backfill idle search)) {
       my $n = $args{policy}->oldest_age($name);
       $oldest = $n if $n > $oldest;
     }

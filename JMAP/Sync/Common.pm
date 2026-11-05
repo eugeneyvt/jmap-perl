@@ -1068,29 +1068,26 @@ sub imap_append {
 }
 
 sub imap_search {
-  my $Self = shift;
-  my $imapname = shift;
-  my @expr = @_;
-
-  my $imap = $Self->connect_imap();
-
-  my $r = $imap->examine($imapname);
-  die "EXAMINE FAILED $imapname" unless $r;
-
-  # XXX - check uidvalidity
-  my $uidvalidity = $imap->get_response_code('uidvalidity') + 0;
-  my $uidnext = $imap->get_response_code('uidnext') + 0;
-  my $highestmodseq = $imap->get_response_code('highestmodseq') || 0;
-  my $exists = $imap->get_response_code('exists') || 0;
-
-  if ($imap->capability->{'search=fuzzy'}) {
-    @expr = ('fuzzy', [@expr]);
+  my ($Self, $imapname, @expr) = @_;
+  for my $attempt (0..1) {
+    my $result = eval {
+      my $imap = $Self->connect_imap($attempt);
+      my $r = $imap->examine($imapname);
+      die "EXAMINE FAILED $imapname" unless $r;
+      my $uidvalidity = $imap->get_response_code('uidvalidity') + 0;
+      my @search = @expr;
+      @search = ('fuzzy', [@search]) if $imap->capability->{'search=fuzzy'};
+      my $uids = $imap->search('charset', 'utf-8', @search);
+      die "Invalid IMAP search response\n" unless ref($uids) eq 'ARRAY';
+      $Self->_unselect($imap);
+      ['search', $imapname, $uidvalidity, $uids];
+    };
+    return $result unless $@;
+    my $error = $@;
+    # Only this read may be repeated after a transport failure. Reconnect
+    # locally; no mutation or indefinite retry, and never return false emptiness.
+    die $error if $attempt || $error !~ /\AIMAPTalk: (?:IMAP Connection closed by other end:|Read timed out on socket)/;
   }
-
-  my $uids = $imap->search('charset', 'utf-8', @expr);
-  $Self->_unselect($imap);
-
-  return ['search', $imapname, $uidvalidity, $uids];
 }
 
 sub create_mailbox {

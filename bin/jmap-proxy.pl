@@ -1507,6 +1507,11 @@ sub send_backend_request {
   # Storage Box reads have a dedicated cancellable process. Search/sync/API
   # account workers never wait behind an uncached attachment's FUSE operation.
   $accountid.=':content' if $ENV{JMAP_RAW_ROOT} && $request eq 'download' && $accountid!~/:/;
+  # Provider full-text searches may spend seconds waiting on IMAP. They must
+  # not hold the worker applying flags or serving cached lists. A mixed batch
+  # containing any mutation remains on the ordinary worker, in original order.
+  $accountid.=':search' if $accountid!~/:/
+    && JMAP::RuntimePolicy::provider_search($request, $args);
   my $bytes = length(JSON::XS::encode_json($args));
   if (my $why = $runtime_policy->admission($accountid, $bytes, scalar(keys %worker_names), exists $backend{$accountid})) {
     $runtime_health->{rejected}++;

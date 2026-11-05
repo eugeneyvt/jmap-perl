@@ -1,9 +1,10 @@
 # Hybrid mail replica and local search (work in progress)
 
-Unpublished 2026-11-04 candidate, stacked on stage2. Production is unchanged.
-Do not install this branch as a completed release: full provider coverage,
-UIDVALIDITY remap, migration/restore rehearsal, application integration and
-operational acceptance remain required.
+Started as an unpublished 2026-11-04 candidate, stacked on stage2. On 2026-11-05
+Unit S runs the schema15 runtime with provider search; the full replica/local
+search remains incomplete. See [current evidence](unit-s-mail-repair-2026-11-05.md).
+Full provider coverage, independent raw restore, UIDVALIDITY handling and local
+search acceptance remain required before promotion.
 
 Original MIME files (including binary attachments) belong on guarded SSHFS
 Storage Box. The SSD holds the ordinary account database, a private per-account

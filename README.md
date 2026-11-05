@@ -4,15 +4,14 @@ Personal compatibility fork of [jmapio/jmap-perl](https://github.com/jmapio/jmap
 See [FORK.md](FORK.md) for supported changes, tested releases, updates and rollback.
 Published images: `ghcr.io/eugeneyvt/jmap-proxy` (`stable`, version tags, `edge`).
 
-Local, unpublished work for the first reliability stage is described in
-[stage1-reliability.md](docs/stage1-reliability.md). It includes a schema change
-and must not be deployed with the existing image-only controller unchanged.
-The stacked [stage 2 query candidate](docs/stage2-query-planner.md) adds SQL
-pagination/snapshots, batched provider-ID mapping and durable list summaries
-(schema v14). Production deployment is separate from this candidate work.
-The following [hybrid replica candidate](docs/stage3-replica.md) adds guarded
-Storage Box originals, SSD text/FTS, durable jobs and streaming content workers
-(schema v15). It is incomplete and is not installed on Unit S.
+The branch contains [stage 1 reliability](docs/stage1-reliability.md),
+[SQL queries and summaries](docs/stage2-query-planner.md), and the guarded
+[hybrid replica candidate](docs/stage3-replica.md), account schema15.
+On 5 November 2026, Unit S accepted runtime code `854b1f9` with Suite mail4.
+Provider search and the existing mailboxes remain live; full raw coverage,
+independent restore and local-search promotion are still incomplete.
+See [the deployment evidence and remaining gates](docs/unit-s-mail-repair-2026-11-05.md).
+This branch deployment is separate from the version-tagged stable channel.
 
 The upstream README follows. Its feature claims are not a guarantee of Frappe
 Suite interoperability; the acceptance limits in FORK.md apply to this fork.

@@ -35,8 +35,17 @@ sub ingest {
     $self->{free_at} = $data->{sampled_at} // time();
   }
   if (ref($data->{delivery}) eq 'HASH') {
-    my $aid = $name; $aid =~ s/:(?:idle|sync|backfill)$//;
+    my $aid = $name; $aid =~ s/:(?:idle|sync|backfill|content|search)$//;
     $self->{delivery}{$aid} = {map {$_ => 0 + ($data->{delivery}{$_} // 0)} qw(pending prepared sending unknown confirmed canceled)};
+  }
+  if (ref($data->{replica}) eq 'HASH' && ($data->{replica}{mode}//'')=~/^(provider|shadow|local)$/) {
+    my $aid=$name;$aid=~s/:(?:idle|sync|backfill|content|search)$//;
+    my %sample=(mode=>$data->{replica}{mode},sampled_at=>$data->{sampled_at}//time());
+    for my $field (qw(ready pending generation inventory_complete encoding_problem_documents)) {
+      my $value=$data->{replica}{$field};
+      $sample{$field}=0+$value if defined($value) && !ref($value) && $value=~/^\d+$/;
+    }
+    $self->{replica}{$aid}=\%sample;
   }
 }
 sub exited {
@@ -57,11 +66,16 @@ sub readiness {
     my $sync = $args{sync_times}{$aid};
     my $age = defined $sync ? $args{now} - $sync : undef;
     my $oldest = 0;
-    for my $name ($aid, map {"$aid:$_"} qw(sync backfill idle)) {
+    for my $name ($aid, map {"$aid:$_"} qw(sync backfill idle search)) {
       my $n = $args{policy}->oldest_age($name);
       $oldest = $n if $n > $oldest;
     }
     my @reasons;
+    my $replica=$self->{replica}{$aid};
+    if ($replica && $replica->{mode} eq 'local') {
+      push @reasons,'local_index_incomplete' unless $replica->{ready};
+      push @reasons,'local_index_sample_stale' if $args{now}-$replica->{sampled_at}>120;
+    }
     push @reasons, 'sync_stale' if !defined($age) || $age > $args{max_sync_age};
     push @reasons, 'request_stalled' if $oldest > $args{max_request_age};
     push @reasons, 'smtp_outcome_unknown' if $self->{delivery}{$aid}{unknown};
@@ -72,7 +86,7 @@ sub readiness {
     $ready = 0 if @reasons;
     push @accounts, {key=>substr(sha256_hex($aid),0,16), ready=>@reasons ? 0 : 1,
       sync_age_seconds=>$age, oldest_request_age_seconds=>$oldest, reasons=>\@reasons,
-      delivery=>$self->{delivery}{$aid}};
+      delivery=>$self->{delivery}{$aid},replica=>$replica};
   }
   my @global;
   push @global, 'accounts_not_discovered' unless $args{discovered};
@@ -82,11 +96,17 @@ sub readiness {
   push @global, 'recent_oom_kill' if defined($self->{last_oom_at}) && $args{now} - $self->{last_oom_at} < 300;
   $ready = 0 if @global;
   return {ready=>$ready, reasons=>\@global, accounts=>\@accounts,
-    free_bytes=>$self->{free_bytes}, index_status=>'not_configured'};
+    free_bytes=>$self->{free_bytes}, index_status=>keys(%{$self->{replica}||{}}) ? 'configured' : 'not_configured'};
 }
 sub metrics {
   my ($self) = @_;
   my @out;
+  for my $aid (sort keys %{$self->{replica}||{}}) {
+    my $key=substr(sha256_hex($aid),0,16);my $replica=$self->{replica}{$aid};
+    for my $field (qw(ready pending generation inventory_complete encoding_problem_documents)) {
+      push @out,'jmap_replica_'.$field.'{account_key="'.$key.'"} '.$replica->{$field} if defined $replica->{$field};
+    }
+  }
   for my $role (sort keys %{$self->{timings}}) {
     for my $stage (sort keys %{$self->{timings}{$role}}) {
       my $t = $self->{timings}{$role}{$stage};

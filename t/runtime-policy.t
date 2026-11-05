@@ -29,4 +29,17 @@ is($p->admission('a',1,0,0),undef,'successful work resets failure history');
 for my $method ('MDN/send','Email/copy','Blob/upload','Calendar/refreshSynced','Whatever/get') {
   ok(!JMAP::RuntimePolicy::safe_read('jmap',{methodCalls=>[[$method,{},'x']]}),"$method is not cancellable");
 }
+is(JMAP::RuntimePolicy::role('a:search'),'search','search timing has a bounded distinct role');
+ok(JMAP::RuntimePolicy::provider_search('jmap',{methodCalls=>[
+  ['Email/query',{filter=>{operator=>'AND',conditions=>[{text=>'example'}]}},'q'],
+  ['Email/get',{'#ids'=>{resultOf=>'q',name=>'Email/query',path=>'/ids'}},'g']]}),
+  'search and its result references stay together on the search worker');
+ok(!JMAP::RuntimePolicy::provider_search('jmap',{methodCalls=>[
+  ['Email/query',{filter=>{text=>'example'}},'q'],['Email/set',{update=>{}},'w']]}),
+  'mixed search/mutation batch retains ordinary ordered dispatch');
+ok(!JMAP::RuntimePolicy::provider_search('jmap',{methodCalls=>[
+  ['Email/query',{filter=>{inMailbox=>'inbox',notKeyword=>'$seen'}},'q']]}),
+  'ordinary unread listing does not wait on the provider search worker');
+ok(!JMAP::RuntimePolicy::provider_search('jmap',{methodCalls=>[
+  ['Whatever/query',{filter=>{text=>'example'}},'q']]}), 'unknown methods are not routed as safe search');
 done_testing;

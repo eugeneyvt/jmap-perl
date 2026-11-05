@@ -1,0 +1,36 @@
+use strict;
+use warnings;
+use Test::More;
+use File::Temp qw(tempdir);
+use Cwd qw(abs_path);
+use Digest::SHA qw(sha256_hex);
+use JMAP::RawStore;
+use JMAP::ContentCache;
+use JMAP::FileResponse;
+my $dir=abs_path(tempdir(CLEANUP=>1));mkdir "$dir/box";mkdir "$dir/user";mkdir "$dir/user/replica-cache";mkdir "$dir/user/replica-content";
+my $available=1;my $calls=0;
+my $store=JMAP::RawStore->new(root=>"$dir/box",account=>'user',guard=>sub {$calls++;$available});
+my $cache=JMAP::ContentCache->new(root=>"$dir/user/replica-cache",max_bytes=>10,max_files=>2);
+sub source {my ($content)=@_;open my $f,'>:raw',"$dir/input" or die $!;print {$f} $content;close $f;return $store->publish("$dir/input",length($content))}
+my $one=source('first');my $two=source('second');
+my $path=$cache->obtain($store,$one->{sha256},$one->{bytes});
+ok(-f $path,'cold raw is verified and copied to SSD');
+$available=0;my $before=$calls;
+is($cache->obtain($store,$one->{sha256},$one->{bytes}),$path,'hot original works during Box outage');
+is($calls,$before,'hot hit never checks the remote mount');
+eval {$cache->obtain($store,$two->{sha256},$two->{bytes})};like($@,qr/mount unavailable/,'uncached original reports temporary unavailability');
+$available=1;$cache->obtain($store,$two->{sha256},$two->{bytes});
+ok(!-e $path,'byte budget evicts only an old disposable cached original');
+eval {$cache->obtain($store,'a'x64,11)};like($@,qr/cache budget/,'large admission is checked before remote I/O');
+my $file="$dir/user/replica-content/download-fixture";
+open my $f,'>:raw',$file;print {$f} 'a'x150000;close $f;
+my ($bytes,$body)=JMAP::FileResponse->prepare($dir,'user',{file=>$file,bytes=>150000,ephemeral=>1});
+ok(!-e $file,'response staging is unlinked after its descriptor is opened');
+is($bytes,150000,'exact Content-Length supplied');
+my ($read,$largest)=(0,0);
+for (1..5) {$body->(sub {$read+=length($_[0]);$largest=length($_[0]) if length($_[0])>$largest})}
+is($read,150000,'stream sends all original bytes');
+cmp_ok($largest,'<=',65536,'response queue holds at most one 64KiB chunk');
+$body->(undef);
+eval {JMAP::FileResponse->prepare($dir,'user',{file=>"$dir/input",bytes=>6})};like($@,qr/Invalid download path/,'parent rejects arbitrary worker file paths');
+done_testing;

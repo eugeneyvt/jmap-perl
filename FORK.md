@@ -50,19 +50,30 @@ to reproduce the image.
   include healthy IDLE account and provider-change counters; no new public port
   or credential is introduced.
 
+- Releases exited child-worker slots through AnyEvent child watchers, so timed-out
+  reads do not permanently consume the process budget.
+- Separates fully read-only provider search batches from cached lists and writes.
+  Mixed batches retain their ordinary worker and command order.
+- Bounds each read-only provider SEARCH attempt, including connection setup,
+  EXAMINE and UNSELECT, to8 seconds. One fresh-connection retry is allowed for
+  transport timeout/closure; provider refusals and mail writes are not replayed.
+  An earlier outer alarm keeps its handler and remaining deadline.
+- Retains the implicit selected Gmail folder for freshly returned UIDs when
+  X-GM-LABELS omits it. Newer authoritative All Mail removals still beat stale
+  folder copies; marking read no longer hides a valid Inbox message.
+
 ## Images and releases
 
-**Unpublished candidate, 2026-11-04:** [stage 1 reliability](docs/stage1-reliability.md)
-adds atomic cache writes, post-commit notifications, bounded work/deadlines,
-private readiness/metrics and a durable SMTP-attempt journal (schema v13).
-The v0.2.3 deployment remains unchanged. Review the migration and rollback gates;
-the image-only update/rollback instructions below do not authorize this migration.
-
-**Stacked unpublished candidate:** [stage 2 SQL queries](docs/stage2-query-planner.md)
-adds bounded row snapshots, SQL pagination/diffs, batched provider UID mapping,
-read/write transactions and persistent list summaries (schema v14). Suite list
-callers need the separately prepared summary-only application change to avoid
-requesting full bodies. Neither candidate is a production release.
+**Unit S runtime deployment, 2026-11-05:** code `854b1f9`, schema15,
+locally built AMD64 image pinned by digest. Native75files/2447 assertions and
+target AMD6475/2459 passed. [Evidence and limits](docs/unit-s-mail-repair-2026-11-05.md).
+Source is pushed to `feat/bridge-mailbox-replica`; this is not a new published
+stable tag. The stage1/2/3 notes describe the earlier candidates and design
+contracts. Runtime code is now installed on Unit S, while the full replica,
+independent raw restore and production local search remain unaccepted.
+Do not apply the old schema12 image-only controller to schema15 or restore old
+mail databases over current state. The current deployment records and compatible
+schema15 images govern its rollback.
 
 Images are published to `ghcr.io/eugeneyvt/jmap-proxy`:
 

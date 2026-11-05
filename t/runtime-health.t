@@ -24,4 +24,15 @@ like($metrics,qr/jmap_worker_exits_total\{role="sync",outcome="signal"\} 1/,'sig
 like($metrics,qr/jmap_backend_admitted_total 1/,'request counter survives worker disappearance');
 unlike($metrics,qr/private|password|SELECT/,'metrics only contain fixed labels');
 unlike(encode_json($h->readiness(%args)),qr/private\@/,'readiness does not expose account address');
+my %replica_args=(%args,now=>402,sync_times=>{'private@example.invalid'=>400});
+$h->ingest('private@example.invalid:sync',{replica=>{mode=>'provider',ready=>0,pending=>10,generation=>2,inventory_complete=>0},sampled_at=>402});
+ok($h->readiness(%replica_args)->{ready},'provider mode can remain ready during local backfill');
+$h->ingest('private@example.invalid:sync',{replica=>{mode=>'local',ready=>0,pending=>1,generation=>2,inventory_complete=>1},sampled_at=>402});
+ok(!$h->readiness(%replica_args)->{ready},'local mode reports incomplete index readiness');
+$h->ingest('private@example.invalid:content',{replica=>{mode=>'local',ready=>1,pending=>0,generation=>3,inventory_complete=>1},sampled_at=>402});
+ok($h->readiness(%replica_args)->{ready},'complete current local index can be ready');
+is($h->readiness(%replica_args)->{index_status},'configured','readiness reports a configured replica');
+my $replica_metrics=join "\n",$h->metrics;
+like($replica_metrics,qr/jmap_replica_pending\{account_key="[a-f0-9]{16}"\} 0/,'private account-keyed replica metric');
+unlike($replica_metrics,qr/private\@/,'replica metrics do not expose email addresses');
 done_testing;

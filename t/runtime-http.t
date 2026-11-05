@@ -23,6 +23,9 @@ if (!$pid) {
   $ENV{JMAP_MGMT_PORT}=$mgmt;$ENV{JMAP_HOST}='127.0.0.1';$ENV{JMAP_MGMT_HOST}='127.0.0.1';
   $ENV{BASEURL}="http://127.0.0.1:$port";$ENV{JMAP_SECRET_KEY}='c' x 64;
   $ENV{JMAP_READ_DEADLINE}=2;$ENV{JMAP_IDLE_ENABLE}=0;$ENV{JMAP_SYNC_INTERVAL}=600;
+  # Exactly one accounts worker and one API worker. A retired process must
+  # release its admission slot before the replacement can be spawned.
+  $ENV{JMAP_MAX_WORKERS}=2;
   open STDOUT,'>',"$dir/proxy.log" or die $!;open STDERR,'>&',\*STDOUT or die $!;
   exec $^X,'-I.','bin/jmap-proxy.pl';die $!;
 }
@@ -68,6 +71,8 @@ for (1..30) {
 }
 like($warm->{content},qr/"Email\/query"/,'cold ordinary request completes as JMAP success, not just HTTP 200');
 my $metrics=$http->get("http://127.0.0.1:$mgmt/metrics")->{content};
+my ($timeouts_before)=$metrics=~/jmap_backend_read_timeouts_total (\d+)/;
+$timeouts_before//=0; # a heavily throttled cold start can already time out
 like($metrics,qr/jmap_operation_seconds_count\{role="api",stage="sql"\}/,'real worker SQL timings reach parent');
 unlike($metrics,qr/synthetic\@|synthetic-only/,'telemetry contains no address or password');
 
@@ -77,6 +82,9 @@ my $started=time();
 my $timeout=query([$q]);
 cmp_ok(time()-$started,'<',4,'blocked safe read fails within bounded deadline');
 unlike($timeout->{content},qr/"Email\/query"/,'expired read is not reported as successful query');
+my $blocked_metrics=$http->get("http://127.0.0.1:$mgmt/metrics")->{content};
+my ($timeouts_after)=$blocked_metrics=~/jmap_backend_read_timeouts_total (\d+)/;
+is(($timeouts_after//0)-$timeouts_before,1,'the deliberately blocked real request is counted exactly once');
 flock($lock,LOCK_UN);close $lock;
 sleep 1.2; # bounded respawn backoff: new worker then starts cleanly
 my $retry=query([$q]);
@@ -86,7 +94,6 @@ for (1..30) {
 }
 like($retry->{content},qr/"Email\/query"/,'reader actually recovers without restarting proxy, not just an HTTP 200 error');
 $metrics=$http->get("http://127.0.0.1:$mgmt/metrics")->{content};
-like($metrics,qr/jmap_backend_read_timeouts_total 1/,'expired real request counted once');
 is($http->get("http://127.0.0.1:$mgmt/healthz")->{status},200,'HTTP parent remains responsive after terminating blocked read');
 
 # A timed-out read behind a write may release its HTTP caller, but must never

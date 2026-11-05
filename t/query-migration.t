@@ -19,7 +19,7 @@ $db->dbh->do('PRAGMA user_version=13');$db->commit;
 $db->begin_read;$account={%{$db->get_user}};$db->commit;
 $db->write_subdir('outbox','held.eml','synthetic held bytes');
 $db=JMAP::ImapDB->new('migrate-query');$db->begin_read;
-is(($db->dbh->selectrow_array('PRAGMA user_version'))[0],14,'v13 upgrades to schema14');
+is(($db->dbh->selectrow_array('PRAGMA user_version'))[0],15,'v13 upgrades to current schema15');
 is_deeply($db->dgetone('jmessages',{msgid=>'preserved'}),$message,'message identity and metadata survive the upgrade');
 is_deeply($db->get_user,$account,'committed account states are not replaced');
 is_deeply($db->dgetone('iserver'),$credentials,'encrypted provider settings are not replaced');
@@ -28,7 +28,7 @@ is(($db->dbh->selectrow_array('PRAGMA quick_check'))[0],'ok','migrated database 
 $db->commit;
 is($db->read_subdir('outbox','held.eml'),'synthetic held bytes','held SMTP bytes are retained');
 $db=JMAP::ImapDB->new('migrate-query');$db->begin_read;
-is(($db->dbh->selectrow_array('PRAGMA user_version'))[0],14,'reopen does not reapply schema migration');$db->commit;
+is(($db->dbh->selectrow_array('PRAGMA user_version'))[0],15,'reopen does not reapply schema migration');$db->commit;
 
 # An interrupted DDL migration must keep v13 and all old mail, not a partial v14.
 my $bad=JMAP::ImapDB->new('failed-query-migration');$bad->begin;
@@ -44,5 +44,5 @@ is(($raw->selectrow_array("SELECT count(*) FROM sqlite_master WHERE name='jemail
 is(($raw->selectrow_array("SELECT msgid FROM jmessages"))[0],'still-here','failed migration preserves original mail');
 $raw->{Callbacks}=undef;$raw->disconnect;
 $bad=JMAP::ImapDB->new('failed-query-migration');$bad->begin_read;
-is(($bad->dbh->selectrow_array('PRAGMA user_version'))[0],14,'a clean retry recovers after the failed migration');$bad->commit;
+is(($bad->dbh->selectrow_array('PRAGMA user_version'))[0],15,'a clean retry recovers after the failed migration');$bad->commit;
 done_testing;

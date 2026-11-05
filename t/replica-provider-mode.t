@@ -1,0 +1,42 @@
+use strict;
+use warnings;
+use Test::More;
+BEGIN {require File::Temp;$ENV{JMAP_DATADIR}=File::Temp::tempdir(CLEANUP=>1);$ENV{JMAP_SECRET_KEY}='f'x64}
+use JMAP::ImapDB;
+my $db=JMAP::ImapDB->new('app-password');
+$db->setuser({username=>'synthetic',password=>'synthetic-only',imapHost=>'imap.gmail.com'});
+ok($db->{is_gmail},'Gmail protocol identity is detected for an ordinary IMAP account');
+isa_ok($db,'JMAP::ImapDB');
+ok(!$db->isa('JMAP::GmailDB'),'app-password authentication is not converted to OAuth');
+is($db->access_token->[2],'synthetic-only','ordinary IMAP token API still returns its configured app password');
+$db=JMAP::ImapDB->new('app-password');
+ok($db->{is_gmail},'provider mode is restored when a new API/sync worker opens the account');
+$db->begin;
+for my $row ([1=>'\\AllMail'],[2=>'\\Trash'],[3=>'\\Spam'],[4=>'\\Junk'],[5=>'Inbox'],[6=>'User label']) {
+  $db->dinsert('ifolders',{ifolderid=>$row->[0],imapname=>"Folder$row->[0]",label=>$row->[1],sep=>'/',uidvalidity=>1,uidfirst=>1,uidnext=>2});
+}
+$db->commit;
+delete $db->{gmail_label_aliases};
+is_deeply([$db->calclabels(undef,{'x-gm-labels'=>['\\Spam','\\All']})],['\\Spam'],'Gmail All pseudo-label is excluded from mailbox membership');
+my $all;
+$db->begin_read;$all=$db->dget('ifolders');$db->commit;
+is_deeply([map {$_->{ifolderid}} @{$db->gmail_source_folders($all)}],[1,2,3,4],'canonical Gmail scope covers All Mail, Trash and Spam/Junk');
+is_deeply([map {$_->{ifolderid}} @{$db->gmail_source_folders([$all->[4],$all->[5]])}],[],'a partial pending-history batch does not mistake absent All Mail rows for disabled All Mail');
+$db->sync_jmailboxes;
+$db->begin_read;
+my $archive=$db->dgetone('jmailboxes',{role=>'archive',active=>1});
+ok($archive,'unlabeled All Mail gets a real virtual Archive identity');
+my $archive_id=$archive->{jmailboxid};
+is($db->dbh->selectrow_array('SELECT count(*) FROM ifolders'),6,'virtual Archive creates no provider/source folder');
+$db->commit;
+$db->sync_jmailboxes;
+$db->begin_read;
+is($db->dgetone('jmailboxes',{role=>'archive',active=>1})->{jmailboxid},$archive_id,'reconciliation preserves the Archive JMAP ID');
+$db->commit;
+$db->begin;$db->dbh->do('DELETE FROM ifolders WHERE ifolderid=1');$db->commit;
+is(scalar @{$db->gmail_source_folders($all)},6,'hidden/disabled All Mail falls back to all visible source folders');
+$db->setuser({username=>'changed-synthetic'});
+ok($db->{is_gmail},'partial settings update preserves provider mode');
+$db->setuser({imapHost=>'imap.yandex.ru'});
+ok(!$db->{is_gmail},'changing an ordinary IMAP host refreshes provider mode');
+done_testing;

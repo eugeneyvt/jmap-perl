@@ -16,6 +16,7 @@ use Net::CardDAVTalk;
 use MIME::Base64 qw(decode_base64);
 use MIME::QuotedPrint qw(decode_qp);
 use Sys::Hostname;
+use Time::HiRes ();
 
 my %ROLE_FLAGS = map { lc $_ => 1 } qw(\\Inbox \\Sent \\Drafts \\Trash \\Junk \\Spam \\Archive \\All \\AllMail \\Flagged \\Important);
 
@@ -708,6 +709,45 @@ sub imap_update {
   return \%res;
 }
 
+# Full-message acquisition for the replica worker. The IMAP library streams
+# the literal directly to an already-open SSD spool, never through JSON IPC.
+sub imap_stream_raw {
+  my ($Self,$imapname,$expected_validity,$uid,$expected_bytes,$fh)=@_;
+  die "Invalid raw fetch identity\n" unless $uid=~/^\d+$/ && $uid>0 && $expected_bytes=~/^\d+$/;
+  my $imap=$Self->connect_imap;
+  my $ok=eval {
+    $imap->examine($imapname) or die "Replica EXAMINE failed\n";
+    die "Replica UIDVALIDITY changed\n" unless $imap->get_response_code('uidvalidity')==$expected_validity;
+    my $seen=0;
+    $imap->literal_handle_control(sub {
+      my ($bytes,$atom)=@_;
+      die "Unexpected replica literal\n" unless lc($atom//'') eq 'body[]' && !$seen++ && $bytes==$expected_bytes;
+      return $fh;
+    });
+    my $data=$imap->fetch({FullBody=>1},$uid,'body.peek[]');
+    $imap->literal_handle_control(0);
+    die "Replica fetch failed\n" if $imap->get_last_error;
+    die "Replica UID disappeared\n" unless ref($data) eq 'HASH' && ref($data->{$uid}) eq 'HASH';
+    my $body=$data->{$uid}{'body[]'};
+    unless ($seen) {
+      die "Invalid replica body\n" unless defined($body) && !ref($body) && length($body)==$expected_bytes;
+      print {$fh} $body or die "Replica spool write failed\n";
+    }
+    $fh->flush or die "Replica spool flush failed\n";
+    die "Replica raw length mismatch\n" unless -s $fh == $expected_bytes;
+    $Self->_unselect($imap);1;
+  };
+  my $error=$@;
+  unless ($ok) {
+    $imap->literal_handle_control(0);
+    # A rejected literal leaves the protocol unread; never reuse that socket.
+    delete $Self->{imap};
+    eval {my $socket=$imap->release_socket;$socket->close if $socket};
+    die $error;
+  }
+  return {bytes=>0+$expected_bytes};
+}
+
 sub imap_fill {
   my $Self = shift;
   my $imapname = shift;
@@ -1028,30 +1068,54 @@ sub imap_append {
   return ['append', $imapname, $uidvalidity, $uid];
 }
 
-sub imap_search {
-  my $Self = shift;
-  my $imapname = shift;
-  my @expr = @_;
-
-  my $imap = $Self->connect_imap();
-
-  my $r = $imap->examine($imapname);
-  die "EXAMINE FAILED $imapname" unless $r;
-
-  # XXX - check uidvalidity
-  my $uidvalidity = $imap->get_response_code('uidvalidity') + 0;
-  my $uidnext = $imap->get_response_code('uidnext') + 0;
-  my $highestmodseq = $imap->get_response_code('highestmodseq') || 0;
-  my $exists = $imap->get_response_code('exists') || 0;
-
-  if ($imap->capability->{'search=fuzzy'}) {
-    @expr = ('fuzzy', [@expr]);
+sub _bounded_search_attempt {
+  my ($Self,$code)=@_;
+  # IMAPTalk's blocking TLS path bypasses its select timeout. Bound the whole
+  # read-only attempt, including login/EXAMINE/UNSELECT, so a stale socket can
+  # be replaced before the HTTP worker's overall deadline kills the request.
+  my $seconds=$Self->{search_attempt_seconds} // 8;
+  die "Invalid search deadline\n" unless $seconds>0 && $seconds<=8;
+  my $started=Time::HiRes::time();
+  my $outer=Time::HiRes::alarm(0);
+  my ($result,$error);
+  {
+    local $SIG{ALRM}=$SIG{ALRM};
+    my $window=$seconds;
+    if ($outer && $outer<=$window) {$window=$outer}
+    else {$SIG{ALRM}=sub {die "JMAP: Provider search attempt timed out\n"}}
+    Time::HiRes::alarm($window);
+    $result=eval {$code->()}; $error=$@;
+    Time::HiRes::alarm(0);
   }
+  # Preserve a pre-existing CLI/supervisor deadline, without extending it or
+  # firing it twice if the original handler already ran during this attempt.
+  my $remaining=$outer-(Time::HiRes::time()-$started);
+  Time::HiRes::alarm($remaining) if $outer && $remaining>0;
+  die $error if length($error);
+  return $result;
+}
 
-  my $uids = $imap->search('charset', 'utf-8', @expr);
-  $Self->_unselect($imap);
-
-  return ['search', $imapname, $uidvalidity, $uids];
+sub imap_search {
+  my ($Self, $imapname, @expr) = @_;
+  for my $attempt (0..1) {
+    my $result = eval { $Self->_bounded_search_attempt(sub {
+      my $imap = $Self->connect_imap($attempt);
+      my $r = $imap->examine($imapname);
+      die "EXAMINE FAILED $imapname" unless $r;
+      my $uidvalidity = $imap->get_response_code('uidvalidity') + 0;
+      my @search = @expr;
+      @search = ('fuzzy', [@search]) if $imap->capability->{'search=fuzzy'};
+      my $uids = $imap->search('charset', 'utf-8', @search);
+      die "Invalid IMAP search response\n" unless ref($uids) eq 'ARRAY';
+      $Self->_unselect($imap);
+      ['search', $imapname, $uidvalidity, $uids];
+    }) };
+    return $result unless $@;
+    my $error = $@;
+    # Only this read may be repeated after a transport failure. Reconnect
+    # locally; no mutation or indefinite retry, and never return false emptiness.
+    die $error if $attempt || $error !~ /\A(?:IMAPTalk: (?:IMAP Connection closed by other end:|Read timed out on socket)|JMAP: Provider search attempt timed out)/;
+  }
 }
 
 sub create_mailbox {

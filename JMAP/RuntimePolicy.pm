@@ -20,7 +20,7 @@ sub new {
 sub role {
   my ($name) = @_;
   return 'accounts' if $name eq '__accounts__';
-  return $1 if $name =~ /:(idle|sync|backfill)$/;
+  return $1 if $name =~ /:(idle|sync|backfill|content|search)$/;
   return 'api';
 }
 sub safe_read {
@@ -36,6 +36,23 @@ sub safe_read {
     return 0 unless $call->[0] =~ /\A(?:Core\/echo|(?:Email|Thread|Mailbox|Identity|EmailSubmission|Quota|Principal|Calendar|CalendarEvent|ParticipantIdentity|CalendarEventNotification|AddressBook|Addressbook|ContactCard|Contact|ContactGroup|FileNode|Blob|SearchSnippet)\/(?:get|query|changes|queryChanges|parse))\z/;
   }
   return 1;
+}
+sub _filter_has_provider_term {
+  my ($filter) = @_;
+  return 0 unless ref($filter) eq 'HASH';
+  return 1 if grep { exists $filter->{$_} } qw(text from to cc bcc subject body header);
+  return scalar(grep { _filter_has_provider_term($_) } @{$filter->{conditions}})
+    if ref($filter->{conditions}) eq 'ARRAY';
+  return 0;
+}
+sub provider_search {
+  my ($command, $args) = @_;
+  return 0 unless $command eq 'jmap' && safe_read($command, $args);
+  for my $call (@{$args->{methodCalls}}) {
+    return 1 if $call->[0] =~ m{\AEmail/(?:query|queryChanges)\z}
+      && ref($call->[1]) eq 'HASH' && _filter_has_provider_term($call->[1]{filter});
+  }
+  return 0;
 }
 sub now { $_[0]{clock}->() }
 sub admission {

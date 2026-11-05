@@ -50,8 +50,13 @@ use JMAP::Telemetry;
 use JMAP::RuntimePolicy;
 use JMAP::RuntimeHealth;
 
-# Backend modules (loaded in child after fork)
-# use JMAP::API; use JMAP::ImapDB; etc.
+# Load code once before forking. Loading the MIME/calendar/DB stack separately
+# in every cold worker costs seconds on a throttled CPU and prevents sharing
+# most of the immutable Perl heap. Constructors, account DBs, credentials and
+# provider sockets remain child-only; no live backend object is created here.
+use IO::Socket::SSL;
+use JMAP::API;
+use JMAP::ImapDB;
 
 my $BASEURL = $ENV{BASEURL} || 'http://localhost:' . ($ENV{JMAP_PORT} || 9000);
 my $jmaphome = $ENV{JMAP_HOME} || '/home/jmap/jmap-perl';
@@ -87,19 +92,9 @@ sub observe_cgroup_memory {
   }
 }
 observe_cgroup_memory();
-my (%worker_names, %registered_accounts);
+my (%worker_names, %worker_watchers, %registered_accounts);
 my $accounts_discovered = 0;
 my $command_sequence = 0;
-
-# Reap zombie children; keep totals after a process disappears.
-my $child_watcher = AnyEvent->signal(signal => 'CHLD', cb => sub {
-  while ((my $pid = waitpid(-1, WNOHANG)) > 0) {
-    my $status = $?;
-    my $name = delete $worker_names{$pid};
-    $runtime_health->exited($name, $status) if defined $name;
-    warn "Reaped child $pid\n";
-  }
-});
 
 #
 # Backend connection management
@@ -112,6 +107,27 @@ my %idle_watch;
 my %realtime_sync;
 my $IDLE_ENABLED = $ENV{JMAP_IDLE_ENABLE} // 0;
 my $IDLE_FALLBACK = $ENV{JMAP_IDLE_FALLBACK_SECONDS} || 30;
+
+# AnyEvent owns SIGCHLD/waitpid. A competing signal watcher can observe the
+# signal after AnyEvent has already reaped the child, leaking its admission
+# slot forever. Watch each PID through the same event-loop child API instead.
+sub watch_worker {
+  my ($pid, $name) = @_;
+  $worker_names{$pid} = $name;
+  $worker_watchers{$pid} = AnyEvent->child(pid => $pid, cb => sub {
+    my (undef, $status) = @_;
+    delete $worker_watchers{$pid};
+    delete $worker_names{$pid};
+    $runtime_health->exited($name, $status);
+    if ($backend{$name} && $backend{$name}[2] == $pid) {
+      delete $backend{$name};
+      $runtime_policy->failed($name);
+      _idle_disconnected($name);
+      _fail_pending($name, 'backend process exited');
+    }
+    warn "Reaped child $pid\n";
+  });
+}
 
 # Take one pending entry, without autovivifying %waiting{$name} for a response
 # we were not expecting.
@@ -279,6 +295,7 @@ sub get_backend {
       %backend = ();
       %waiting = ();
       %worker_names = ();
+      %worker_watchers = ();
       # The child uses blocking IO, not the parent's event loop. Inherited
       # signal watchers must not make a read-deadline termination ineffective.
       $SIG{TERM} = 'DEFAULT';
@@ -321,7 +338,7 @@ sub get_backend {
         _fail_pending($accountid, 'backend closed connection');
       },
     ), 0, $pid, time()];
-    $worker_names{$pid} = $accountid;
+    watch_worker($pid, $accountid);
 
     $backend{$accountid}[0]->push_read(json => mk_json($accountid));
   }
@@ -778,6 +795,12 @@ sub run_backend_worker {
         return ['filenode_put', $db->put_filenode_content($args->{id}, $bytes, $args->{type})];
       }
       if ($cmd eq 'download') {
+        if ($db->isa('JMAP::ImapDB') && $ENV{JMAP_RAW_ROOT}) {
+          require JMAP::ReplicaContent;
+          my $file=eval {JMAP::ReplicaContent->download($db,$args->{blobId})};
+          return ['download',{status=>503,error=>'Mail content temporarily unavailable'}] if $@;
+          return ['download',$file] if $file;
+        }
         if ($db->can('proxy_blob')) {
           my ($dtype, $content) = $db->proxy_blob(
             $args->{blobId}, $args->{name}, $args->{type});
@@ -1097,6 +1120,13 @@ sub run_backend_worker {
       if ($db && $db->isa('JMAP::ImapDB')) {
         require JMAP::Delivery;
         $sample->{delivery} = JMAP::Delivery->summary($db);
+        if (my $replica=$db->local_replica) {
+          $db->begin_read;
+          my $catalog=JMAP::Replica->catalog_token($db);
+          $db->commit;
+          my $coverage=$replica->coverage($catalog);
+          $sample->{replica}={map {$_=>$coverage->{$_}} qw(mode ready pending generation inventory_complete encoding_problem_documents)};
+        }
       }
       $sample->{sampled_at} = time();
       $last_space_sample = time();
@@ -1474,6 +1504,14 @@ sub send_backend_request {
   my $args = shift;
   my $cb = shift;
   my $errcb = shift;
+  # Storage Box reads have a dedicated cancellable process. Search/sync/API
+  # account workers never wait behind an uncached attachment's FUSE operation.
+  $accountid.=':content' if $ENV{JMAP_RAW_ROOT} && $request eq 'download' && $accountid!~/:/;
+  # Provider full-text searches may spend seconds waiting on IMAP. They must
+  # not hold the worker applying flags or serving cached lists. A mixed batch
+  # containing any mutation remains on the ordinary worker, in original order.
+  $accountid.=':search' if $accountid!~/:/
+    && JMAP::RuntimePolicy::provider_search($request, $args);
   my $bytes = length(JSON::XS::encode_json($args));
   if (my $why = $runtime_policy->admission($accountid, $bytes, scalar(keys %worker_names), exists $backend{$accountid})) {
     $runtime_health->{rejected}++;
@@ -2459,6 +2497,16 @@ sub do_raw {
         # JMAP_FILES_MAX_BYTES: 501, streaming not implemented)
         return $req->respond([$result->{status}, 'error', { 'Content-Type' => 'text/plain' }, $result->{error} // "error $result->{status}"])
           if ref $result eq 'HASH' && $result->{status};
+        if (ref($result) eq 'HASH' && $result->{file}) {
+          require JMAP::FileResponse;
+          my ($bytes,$body)=eval {JMAP::FileResponse->prepare($datadir,$accountid,$result)};
+          return $req->respond([503,'unavailable',{},'Mail content temporarily unavailable']) if $@;
+          (my $enc_name=$name)=~s/([^\w.\-])/sprintf('%%%02X',ord($1))/ge;
+          return $req->respond([200,'ok',{
+            'Content-Type'=>$result->{type}||'application/octet-stream','Content-Length'=>$bytes,
+            'Content-Disposition'=>"attachment; filename*=UTF-8''$enc_name",
+            'Cache-Control'=>'private, immutable, max-age=31536000'},$body]);
+        }
         # RFC 8620 S6.2: no blob, no data -- that is not a 200.
         return $req->respond([404, 'not found', {}, 'not found'])
           unless ref $result eq 'ARRAY' && defined $result->[1];

@@ -16,6 +16,7 @@ use Net::CardDAVTalk;
 use MIME::Base64 qw(decode_base64);
 use MIME::QuotedPrint qw(decode_qp);
 use Sys::Hostname;
+use Time::HiRes ();
 
 my %ROLE_FLAGS = map { lc $_ => 1 } qw(\\Inbox \\Sent \\Drafts \\Trash \\Junk \\Spam \\Archive \\All \\AllMail \\Flagged \\Important);
 
@@ -1067,10 +1068,37 @@ sub imap_append {
   return ['append', $imapname, $uidvalidity, $uid];
 }
 
+sub _bounded_search_attempt {
+  my ($Self,$code)=@_;
+  # IMAPTalk's blocking TLS path bypasses its select timeout. Bound the whole
+  # read-only attempt, including login/EXAMINE/UNSELECT, so a stale socket can
+  # be replaced before the HTTP worker's overall deadline kills the request.
+  my $seconds=$Self->{search_attempt_seconds} // 8;
+  die "Invalid search deadline\n" unless $seconds>0 && $seconds<=8;
+  my $started=Time::HiRes::time();
+  my $outer=Time::HiRes::alarm(0);
+  my ($result,$error);
+  {
+    local $SIG{ALRM}=$SIG{ALRM};
+    my $window=$seconds;
+    if ($outer && $outer<=$window) {$window=$outer}
+    else {$SIG{ALRM}=sub {die "JMAP: Provider search attempt timed out\n"}}
+    Time::HiRes::alarm($window);
+    $result=eval {$code->()}; $error=$@;
+    Time::HiRes::alarm(0);
+  }
+  # Preserve a pre-existing CLI/supervisor deadline, without extending it or
+  # firing it twice if the original handler already ran during this attempt.
+  my $remaining=$outer-(Time::HiRes::time()-$started);
+  Time::HiRes::alarm($remaining) if $outer && $remaining>0;
+  die $error if length($error);
+  return $result;
+}
+
 sub imap_search {
   my ($Self, $imapname, @expr) = @_;
   for my $attempt (0..1) {
-    my $result = eval {
+    my $result = eval { $Self->_bounded_search_attempt(sub {
       my $imap = $Self->connect_imap($attempt);
       my $r = $imap->examine($imapname);
       die "EXAMINE FAILED $imapname" unless $r;
@@ -1081,12 +1109,12 @@ sub imap_search {
       die "Invalid IMAP search response\n" unless ref($uids) eq 'ARRAY';
       $Self->_unselect($imap);
       ['search', $imapname, $uidvalidity, $uids];
-    };
+    }) };
     return $result unless $@;
     my $error = $@;
     # Only this read may be repeated after a transport failure. Reconnect
     # locally; no mutation or indefinite retry, and never return false emptiness.
-    die $error if $attempt || $error !~ /\AIMAPTalk: (?:IMAP Connection closed by other end:|Read timed out on socket)/;
+    die $error if $attempt || $error !~ /\A(?:IMAPTalk: (?:IMAP Connection closed by other end:|Read timed out on socket)|JMAP: Provider search attempt timed out)/;
   }
 }
 

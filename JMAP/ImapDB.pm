@@ -3163,8 +3163,9 @@ sub calclabels {
   my $forcelabel = shift;
   my $data = shift;
 
-  # Gmail returns the complete label set on every label view. A folder-local
-  # override would turn an authoritative removal into stale unioned labels.
+  # A UID returned by a fresh selected-folder FETCH belongs to that folder.
+  # Gmail can omit this implicit label from X-GM-LABELS (including Inbox).
+  # Add only that observed membership, never union stale cached folder copies.
   if ($Self->{is_gmail} && ref($data->{'x-gm-labels'}) eq 'ARRAY') {
     unless ($Self->{gmail_label_aliases}) {
       my $owned=$Self->in_transaction ? 0 : 1;
@@ -3184,6 +3185,9 @@ sub calclabels {
         $label=$map->{$known} if defined $known;
       }
       push @labels,$label;
+    }
+    if (defined($forcelabel) && length($forcelabel) && lc($forcelabel) !~ /^\\all(?:mail)?$/) {
+      push @labels, $forcelabel unless grep {lc($_) eq lc($forcelabel)} @labels;
     }
     return @labels;
   }

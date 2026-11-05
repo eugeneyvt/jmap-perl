@@ -6,8 +6,9 @@ BEGIN {require File::Temp;$ENV{JMAP_DATADIR}=File::Temp::tempdir(CLEANUP=>1);$EN
 use JMAP::GmailDB;
 my $db=JMAP::GmailDB->new('labels');
 $db->setuser({username=>'synthetic',password=>'synthetic',imapHost=>'example.invalid'});
-is_deeply([$db->calclabels('Sent',{'x-gm-labels'=>['INBOX','Other']})],['INBOX','Other'],'Gmail source preserves full provider labels rather than forcing its selected folder');
-is_deeply([$db->calclabels('Sent',{'x-gm-labels'=>[]})],[],'authoritative empty label set is preserved');
+is_deeply([$db->calclabels('Sent',{'x-gm-labels'=>['INBOX','Other']})],['INBOX','Other','Sent'],'Gmail preserves explicit labels alongside fresh selected-folder membership');
+is_deeply([$db->calclabels('Sent',{'x-gm-labels'=>[]})],['Sent'],'empty explicit labels do not erase the fresh selected folder');
+is_deeply([$db->calclabels(undef,{'x-gm-labels'=>[]})],[],'authoritative All Mail empty label set is preserved');
 $db->begin;
 for my $row ([1=>'INBOX','inbox'],[2=>'Other','other']) {
   $db->dinsert('ifolders',{ifolderid=>$row->[0],imapname=>$row->[1],label=>$row->[1],jmailboxid=>$row->[2],sep=>'/'});
